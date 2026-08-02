@@ -1,0 +1,30 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "keicoin-example-carpet-markets",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-07-01",
+  // bananojs reaches for a couple of Node built-ins for key derivation.
+  "compatibility_flags": ["nodejs_compat"],
+
+  // The client, built by `bun run build:site` into dist/examples/carpet-markets/
+  // so the asset paths match the URLs they are served at.
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  },
+
+  // The chain and the market. One object, one name, so everybody trades against
+  // the same book.
+  "durable_objects": {
+    "bindings": [{ "name": "FLOOR", "class_name": "Floor" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Floor"] }],
+
+  // More specific than keicoin-site's route, so this Worker owns the demo and
+  // the site owns everything else (SPEC §10.4).
+  "routes": [{ "pattern": "keicoin.org/examples/carpet-markets*", "zone_name": "keicoin.org" }],
+
+  "observability": { "enabled": true }
+}

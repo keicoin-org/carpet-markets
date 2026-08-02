@@ -1,0 +1,32 @@
+name: check
+
+# The curve decides what people pay and the economy tests are where the badge on
+# every listing is either true or marketing, so both run on every push.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.0
+
+      - run: bun install --frozen-lockfile
+
+      - name: typecheck
+        run: bun run typecheck
+
+      - name: typecheck the worker against Cloudflare's globals
+        run: bun run typecheck:worker
+
+      - name: test
+        run: bun test
+
+      - name: the client still bundles for a browser
+        run: bun run build:site

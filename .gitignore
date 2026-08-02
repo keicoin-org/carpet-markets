@@ -1,0 +1,7 @@
+node_modules/
+public/build/
+dist/
+.wrangler/
+*.log
+.env
+.DS_Store

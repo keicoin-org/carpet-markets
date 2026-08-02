@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "types": ["bun"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true
+  },
+  // `worker/` is deliberately absent: it compiles against Cloudflare's globals,
+  // not Bun's, and one `types` array cannot be both. `bun run check:deploy`
+  // typechecks it with wrangler, which has the right ambient types.
+  "include": ["src", "server", "shared", "test", "build.ts"]
+}
