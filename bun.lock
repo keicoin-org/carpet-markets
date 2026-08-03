@@ -4,7 +4,7 @@
     "": {
       "name": "carpet-markets",
       "dependencies": {
-        "kei-transaction": "^0.2.0",
+        "kei-transaction": "^0.3.0",
       },
       "devDependencies": {
         "@cloudflare/workers-types": "^5.20260801.1",
@@ -149,15 +149,17 @@
 
     "@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.9", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.0.3", "@jridgewell/sourcemap-codec": "^1.4.10" } }, "sha512-3Belt6tdc8bPgAtbcmdtNJlirVoTmEb5e2gC94PnkwEW9jI6CAHUeoG85tjWP5WquqfavoMtMwiG4P926ZKKuQ=="],
 
-    "@keicoin/claims": ["@keicoin/claims@0.2.0", "", { "dependencies": { "@keicoin/core": "^0.2.0" } }, "sha512-WI5QLE06BEVOOcr1z5YIqxAjgw8wTve4vXL2ayaVw+dr2qcyigEY4wQNVSxxdhItcNVb8wRu8BdLDfGW8DN6hg=="],
+    "@keicoin/claims": ["@keicoin/claims@0.3.0", "", { "dependencies": { "@keicoin/core": "^0.3.0" } }, "sha512-0cCxXRMcoLxJwrKUgBaDaHIFLA6Ddw+lSL7SUhX03QGwiM5VjMHDtQvxHo1CnTHr3yGaWXRhIzp9is2/OuWIrA=="],
 
-    "@keicoin/core": ["@keicoin/core@0.2.0", "", { "dependencies": { "@bananocoin/bananojs": "^2.10.10" } }, "sha512-GsD8kb5vBkDVXhh1jiLIO6b5Y5nseTrwj7/U5dS2z6Es7irEyfRhhrHsGXbS3ueI0ng7+18lrsA+/6kIrAt/4w=="],
+    "@keicoin/core": ["@keicoin/core@0.3.0", "", { "dependencies": { "@bananocoin/bananojs": "^2.10.10" } }, "sha512-DnwKQlp2Qgx9SIegV7pfdypAw7gW+/fX0ZoEzvgD85e50zpbD1kR+LK7dGi8phCjpct3Jd8M4mQq5koGhJy6tQ=="],
 
-    "@keicoin/tokens": ["@keicoin/tokens@0.2.0", "", { "dependencies": { "@keicoin/claims": "^0.2.0", "@keicoin/core": "^0.2.0" } }, "sha512-BeV9lU5r7XH0fN+ACGy/aMAJtt75MBIxxQ7GOsUwv165RsRwoXL+BCsy3uAdX0gx3HkwBYlOSojM8bcxONdqaw=="],
+    "@keicoin/market": ["@keicoin/market@0.1.0", "", { "dependencies": { "@keicoin/core": "^0.3.0" } }, "sha512-HG5MlHeSHjHhlVVGwph7nbgF7Rvhbq+2oXkDZX8eLvcHNiwkDDHcnB7ls6fPOJtNQIMiBpmkBWf7HxsMShXJtw=="],
 
-    "@keicoin/wallet": ["@keicoin/wallet@0.2.0", "", { "dependencies": { "@keicoin/claims": "^0.2.0", "@keicoin/core": "^0.2.0", "@keicoin/tokens": "^0.2.0" } }, "sha512-luXb0I+LXHpqBrDbd99AEMXF/CetDuqXS6xRxTcYUpchx7PuUAHLRL8c/0ZUJSF6bGLZm5kuAj+h0HXfy/3Dzw=="],
+    "@keicoin/tokens": ["@keicoin/tokens@0.3.0", "", { "dependencies": { "@keicoin/claims": "^0.3.0", "@keicoin/core": "^0.3.0" } }, "sha512-ZtFpRRhM03xm721hLd7SoQwbe6gYGQcHkQ69Fkxogs9CZPSmATYYqXm5gW7x2dcE/1URau7G7uUU/I3QQvZkcw=="],
 
-    "@keicoin/work": ["@keicoin/work@0.2.0", "", { "dependencies": { "@keicoin/core": "^0.2.0" }, "bin": { "kei-work-server": "dist/cli.js" } }, "sha512-omMQo/jh5y4ydsnnuONvdocwwQLzc+QdFNzmV8fq0cgfufp0UHJ55kE3bS8+joF78gfiGM/LxYKPJbz+ivgY8A=="],
+    "@keicoin/wallet": ["@keicoin/wallet@0.3.0", "", { "dependencies": { "@keicoin/claims": "^0.3.0", "@keicoin/core": "^0.3.0", "@keicoin/tokens": "^0.3.0" } }, "sha512-uJpO1xBctlaWpEQmPprc2GZPBsMnzf99UIkiPfl9LTrUhpADNgWQSxylwyVpbyvlpBZtBrO+cDzQqZ3b8G09gA=="],
+
+    "@keicoin/work": ["@keicoin/work@0.3.0", "", { "dependencies": { "@keicoin/core": "^0.3.0" }, "bin": { "kei-work-server": "dist/cli.js" } }, "sha512-cGpprSNYwoduWKcRWj4QRzzgDdmQbEq/KjBlSl9j61z7CnNMZsSsIKoVFAbTBhrRWUQC2FfiD0ma5OyZNiFZeQ=="],
 
     "@poppinss/colors": ["@poppinss/colors@4.1.6", "", { "dependencies": { "kleur": "^4.1.5" } }, "sha512-H9xkIdFswbS8n1d6vmRd8+c10t2Qe+rZITbbDHHkQixH5+2x1FDGmi/0K+WgWiqQFKPSlIYB7jlH6Kpfn6Fleg=="],
 
@@ -187,7 +189,7 @@
 
     "fsevents": ["fsevents@2.3.3", "", { "os": "darwin" }, "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw=="],
 
-    "kei-transaction": ["kei-transaction@0.2.0", "", { "dependencies": { "@keicoin/claims": "^0.2.0", "@keicoin/core": "^0.2.0", "@keicoin/tokens": "^0.2.0", "@keicoin/wallet": "^0.2.0", "@keicoin/work": "^0.2.0" } }, "sha512-JXkTBeTkC7MyDbAyly/++5Z3q2uGZq9ixaMOkDBMpOgclWfTsuoZY8QRJHhQIecSa2+aztAgVJrlcAYlKJDOdw=="],
+    "kei-transaction": ["kei-transaction@0.3.0", "", { "dependencies": { "@keicoin/claims": "^0.3.0", "@keicoin/core": "^0.3.0", "@keicoin/market": "^0.1.0", "@keicoin/tokens": "^0.3.0", "@keicoin/wallet": "^0.3.0", "@keicoin/work": "^0.3.0" } }, "sha512-VjCEsiIQaySVn3GUaABQV6QCM/TGwJ3ornHJ7fNi/qnc7trseSXDF7ixU/9wT3Ffv3a/KLodkJ3OlrBxt2u9CQ=="],
 
     "kleur": ["kleur@4.1.5", "", {}, "sha512-o+NO+8WrRiQEE4/7nwRJhN1HWpVmJm511pBHUxPLtp0BUISzlBplORYSmTclCnJvQq2tKu/sgl3xVpkc7ZWuQQ=="],
 

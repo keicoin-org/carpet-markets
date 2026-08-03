@@ -1,11 +1,13 @@
 # Carpet Markets
 
-A coin launchpad, in the pump.fun shape: anybody can launch a token in one
-click, it trades against a bonding curve, the price goes up while people buy and
-down while they sell, and if enough money ends up in the reserve the coin
-graduates and leaves.
+A coin launchpad, in the pump.fun shape: anybody can launch a token in one click,
+whoever launched it is holding all of it, and from there it is worth whatever the
+next person will pay.
 
-The difference is the deed.
+There is no bonding curve and no house. Every trade here is an offer one player
+wrote and another accepted — `swap_offer` and `swap_accept`, settled in one block
+by consensus (SPEC §9.2). This is what `@keicoin/market` is for, and this repo is
+the example of it.
 
 ```sh
 bun install
@@ -15,92 +17,105 @@ bun run dev          # http://localhost:7788
 > **This is a demo.** The chain underneath is an in-memory mock served by the
 > same process. It dies when you stop the server, every coin you can launch on it
 > is worthless by construction, and that is exactly what makes it safe to show
-> you how a rug pull works from the inside.
+> you how a market like this actually behaves.
 
 ## The point
 
-Every coin here has a **deed**: one item, minted to whoever launched it. The deed
-is the authority to take the reserve, and taking the reserve means sending the
-deed back to the market. So "can this coin be rugged?" is not a promise anybody
-makes. It is the deed's transfer policy — chosen at launch, enforced by
-consensus, and immutable afterwards (SPEC §5.4):
+There is no mechanic here called "rug". A creator is minted the whole supply at
+launch and can sell it, in whatever size they choose, whenever they choose. That
+is not an exploit and it is not a special power — it is selling, which is the
+only thing anybody on this market can do.
 
-| | The deed | What it means |
+What the chain decides is whether that market can exist at all. A coin's
+`transfer` policy is chosen at issuance, enforced by consensus, and immutable
+afterwards (SPEC §5.4):
+
+| | `transfer` | What it means |
 |---|---|---|
-| **Carpet** | `transfer: 'open'` | It can be sent back. The reserve can be taken. It probably will be. |
-| **Nailed down** | `transfer: 'none'` | Soulbound. There is no message anybody can sign that moves the reserve out. |
+| **Open** | `'open'` | Anybody can send it to anybody, so there is a real order book — and the creator is holding a million of them. |
+| **Issuer only** | `'issuer-only'` | Units move only to or from the issuing account. An offer between two holders is an invalid block, so no player-to-player market exists or can. |
+| **Soulbound** | `'none'` | Nothing moves, ever. It cannot be sold, by anybody, including whoever made it. |
 
 A database can hold the same flag. A developer can edit the row. That is the
-whole difference, and it is why the rug is a mechanic in this game rather than a
-warning printed above it: a player can read the badge, buy the carpet coin
-anyway, watch the creator empty it, and check afterwards that the chain said so
-the entire time.
+whole difference: a player can read the badge, buy the open coin anyway, watch
+the creator work through their position a thousand at a time, and check
+afterwards that the chain said so the entire time.
 
-The market never claims a coin is safe. It shows you what was issued.
+The site never claims a coin is safe. It shows you what was issued.
 
 ## The loop
 
 | | |
 |---|---|
-| **Launch** | Name a coin, pick its deed, pay the fee. You get the deed. |
-| **Buy** | Send Kei. The curve prices it, the market mints, the change comes back. |
-| **Sell** | Send coins back. The curve pays you and the coins are burned. |
-| **Graduate** | Cross 10 Kei of reserve and the curve closes for good. Holders get a badge. |
-| **Rug** | Send the deed back. The whole reserve is yours. Only if the deed transfers. |
+| **Launch** | Name a coin, pick who may move it, pay the fee. You are minted the whole supply. |
+| **Sell** | Write an offer: how many, and what you want for them. The coins lock until it settles or you cancel. |
+| **Buy** | Accept somebody's offer. One block, both legs, or neither. |
+| **Cancel** | Take back your own unaccepted offer, and the coins with it. |
 
-### The curve
+### There is no curve, deliberately
 
-Linear in supply — `price = 0.00000006 + 0.00000000006 × sold` — over a million
-coins, so the last one costs about a thousand times the first and filling the
-whole curve takes about 30 Kei. Linear rather than the constant-product curve an
-AMM would use, because you can check this one by hand.
+An earlier version of this priced everything with a linear bonding curve: the
+server minted on every buy, burned on every sell, and paid people out of a
+reserve it held. That made the server the counterparty to every trade, which is
+the payment infrastructure Kei exists to remove (SPEC §5.2) — and it meant the
+"price" was a formula, not a price.
 
-There is no spread and no fee. Buying `n` and selling `n` back returns exactly
-what it cost, which `test/curve.test.ts` asserts, because a market maker that
-quietly skimmed would be a more realistic toy and a worse explanation.
+Now the price is the last thing two people agreed on, and `market.price()` reads
+it off the settled `swap_accept` blocks. A coin nobody has traded has no price,
+and the page says so instead of quoting one.
 
-The reserve is never a running total. It is recomputed from supply every time it
-matters, so a dropped update makes a payout wrong by nothing instead of by an
-accumulated drift.
+It also removed *graduation*, a threshold at which the curve closed and the coin
+"left". It was borrowed from the thing this repo is making fun of and it made the
+demo worse: it put a clock on the only decision that mattered.
 
-### The launch fee is real
+### The launch fee is flat, and that is the fix
 
-Issuing an asset burns Kei, and the nth asset an account issues burns n Kei
-(SPEC §5.6.5). A launch issues two — the coin and its deed — so it costs the nth
-burn plus the (n+1)th, and **every launch on this market costs more than the last
-one, forever**. The first is about 3 Kei. The fiftieth is over 100.
+Issuing an asset burns Kei, and the nth asset an **account** issues burns n Kei
+(SPEC §5.6.5). The rule is per account, and its purpose is that one account
+cannot cheaply create a great many permanent asset records.
 
-That is charged to the launcher because it is real: the Kei is destroyed, not
-collected. It is also the only reason this market cannot become the thing it is
-making fun of — there is no rate limit that works on free keypairs, but issuance
-is the one cost an account cannot shed.
+This repo used to issue every coin from the registry's own account, which turned
+that per-account rule into a tax on arriving late: the fiftieth visitor paid for
+the forty-nine launches before theirs, a newcomer's *first* coin was the most
+expensive thing on the site, and the whole place stopped working somewhere around
+the thousandth coin. The code called that the anti-spam mechanism. It was the
+bug.
 
-### Why graduation exists
-
-A graduated coin is out of the building. The curve closes, the reserve is locked
-for everybody including the deed holder, and the coin only moves between players
-from then on — which it can, because its transfer policy said so at issuance and
-nothing has changed since.
-
-It is delivered as **one** commit covering every holder, which each of them then
-claims from their own chain (SPEC §5.5). A mint per holder would put the whole
-market behind one account's chain and the queue would become the game.
+Every coin now gets its own issuing account, derived from the registry's seed by
+index. A launch pays that account's first burn — **1 Kei, forever** — and never
+anybody else's. Spam is still bounded, per launcher, exactly as the spec intended.
 
 ## Where things are
 
 ```
-shared/curve.ts       the bonding curve. Pure, integer, and the only place a price is decided.
+shared/format.ts      turning numbers into text. Used to be the bonding curve.
 shared/listing.ts     the wire shape, and what a valid coin identity is.
-server/market.ts      the issuer: coins, deeds, the curve, the rug. The whole backend.
-server/main.ts        one Bun server: the mock node at /rpc, the market at /market/*, the client at /
+server/registry.ts    issues coins, and remembers who to read. The whole backend.
+server/main.ts        one Bun server: the mock node at /rpc, the registry at /market/*, the client at /
 src/market-client.ts  every line of Kei in the client.
 src/main.ts           the market floor.
 src/ui.ts             elements and the chart.
 ```
 
-`src/market-client.ts` is the file to read if you are here to learn the SDK.
-`server/market.ts` is the file to read if you are here to learn what a game
-server still has to do when it does not own the money.
+`src/market-client.ts` is the file to read if you are here to learn
+`@keicoin/market`. `server/registry.ts` is the file to read if you are here to
+learn what a server still has to do when it is not allowed to touch the money.
+
+## What the server is, and is not
+
+It is not a market. It never holds a coin, never quotes a price, and cannot move
+anybody's balance. It does two things, and both are things a chain deliberately
+does not do:
+
+1. **It issues.** A coin needs an issuing account and issuance burns Kei.
+2. **It is the list of who to read.** `market.offers()` requires a `from`,
+   because an offer lives on its author's chain — "every offer on the network" is
+   an indexer, and SPEC §9.4 says Kei does not ship one. Somebody has to remember
+   which accounts have touched a coin.
+
+Everything it reports is read back off the chain. A reader with the same list of
+accounts gets the same answer without asking this server anything, which is the
+property worth having and the reason it is an index rather than an oracle.
 
 ## No database
 
@@ -109,56 +124,60 @@ file. Who holds which coin is a question the chain answers, and asking it is
 `balanceOf`.
 
 What is in memory is the part the chain has no opinion about: which coins exist,
-who launched them, and which quotes are outstanding. Stop the process and that is
-gone — along with the mock chain it was describing, so nothing is left dangling.
+who to read, and which quotes are outstanding. Stop the process and that is gone
+— along with the mock chain it was describing, so nothing is left dangling.
 
-## Three things worth stealing
+## Four things worth stealing
 
 Written down because each one cost an afternoon.
 
+- **`sell({ amount, price })` takes the total ask, not the price each.** The
+  `Offer` that comes back reports `price` *per unit*, so the two differ by
+  `amount`. Getting it backwards mislists by several orders of magnitude on a
+  coin with a million units. `src/market-client.ts` multiplies in one place for
+  exactly this reason.
+- **`market.price()` defaults to your own trades.** Pass `{ from }` or a wallet
+  that has never traded summarises nothing and returns null, which reads like the
+  coin has no history.
 - **A payment event carries a JS number.** `PaymentEvent.amount` is a `double`,
-  and a double cannot hold eighteen decimal places: a fee of exactly 7.1 Kei
-  arrives as `7.099999999999999645`. An equality check against a quote therefore
-  rejects real payments. Quote conservatively, accept a documented dust
-  tolerance, charge from your own arithmetic, and refund the change.
+  and a double cannot hold eighteen decimal places: a fee of exactly 1.1 Kei
+  arrives as `1.0999999999999999`. An equality check against a quote therefore
+  rejects real payments. Accept a documented dust tolerance and refund the change.
 - **Minted coins are a receivable, not a balance.** They are owed until the
   recipient's wallet signs for them. Selling before `sync()` fails with
   "balance is 0", which is correct and reads like a bug in the market.
-- **A commit publishes a root; it does not deliver anything.** The entitlement is
-  worth nothing until the holder gets a proof and writes their own claim. Someone
-  has to hand the proof over — here that is `GET /market/claims`.
 
 ## Honest about what this is not
 
-- **Nothing here is worth anything**, on purpose. There is no mainnet, and a game
-  about rug pulls is not the place to find out what one feels like with money in
-  it.
-- **The market has one open quote per address.** A Kei transfer carries no memo,
-  so an arriving payment says only who sent it and how much; that is enough
-  exactly when an address has one outstanding quote. Two browser tabs racing is
-  a thing you can do to yourself. The honest fix is a memo field in the wire
-  format, not a cleverer guess on this side.
-- **The market keeps unmatched payments.** Send it Kei answering no quote and it
-  stays there. Reflexively refunding whoever sends money would make the market
-  return its own working capital to the faucet on startup.
-- **The rug is not an exploit and not a bug.** It is the documented behaviour of
-  a transferable deed. If you would like it to be impossible, that is the other
-  radio button, and it is impossible at the ledger rather than here.
-- **A graduated coin has no market.** The curve is closed and Kei's swap desk is
-  not merged yet, so it transfers peer-to-peer and nothing quotes it. That is
-  what graduating actually means in a game with no exchange to graduate to.
+- **Nothing here is worth anything**, on purpose. There is no mainnet, and a demo
+  about people losing money is not the place to find out what that feels like
+  with money in it.
+- **The book is only as complete as the account list.** The registry lists offers
+  from accounts it has heard of. An offer written by a wallet that never
+  announced itself is perfectly valid, settles perfectly well, and does not
+  appear here — which is what SPEC §9.4 means when it says there is no indexer.
+- **The registry has one open quote per address.** A Kei transfer carries no
+  memo, so an arriving payment says only who sent it and how much. Two browser
+  tabs racing is a thing you can do to yourself. The honest fix is a memo field
+  in the wire format, not a cleverer guess on this side.
+- **The registry keeps unmatched payments.** Send it Kei answering no quote and
+  it stays there. Reflexively refunding whoever sends money would make it return
+  its own working capital to the faucet on startup.
+- **A creator selling their whole position is not an exploit.** It is the
+  documented behaviour of `transfer: 'open'`. If you would like it to be
+  impossible, that is the other radio button, and it is impossible at the ledger
+  rather than here.
 
 ## Checks
 
 ```sh
-bun test          # the curve, and the whole economy against a real ledger
-bun run typecheck
+bun run check     # typecheck, worker typecheck, and the tests
 ```
 
-`test/market.test.ts` is where the claim on the badge is either true or
-marketing. It asserts at the ledger that a soulbound deed cannot be sent back,
-that a transferable one empties the reserve to whoever holds it, and that a
-holder of a rugged coin still holds every coin they bought — because they always
-did, and owning them never meant they were worth anything.
+`test/registry.test.ts` is where the claim on the badge is either true or
+marketing. It asserts at the ledger that a soulbound coin cannot be offered at
+all, that an issuer-only coin cannot be traded between two holders, that an open
+one settles peer-to-peer in whatever size the seller chose, and that the launch
+fee does not move as coins pile up.
 
 MIT.

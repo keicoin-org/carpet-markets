@@ -2,7 +2,7 @@
   "name": "carpet-markets",
   "version": "0.1.0",
   "private": true,
-  "description": "A coin launchpad on Kei, where the difference between a rug and a real one is a transfer policy the chain enforces.",
+  "description": "A coin launchpad on Kei, with a real peer-to-peer order book, where whether a coin can be dumped on you is a transfer policy the chain enforces.",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -21,7 +21,7 @@
     "test": "bun test"
   },
   "dependencies": {
-    "kei-transaction": "^0.2.0"
+    "kei-transaction": "^0.3.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260801.1",

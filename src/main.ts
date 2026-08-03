@@ -4,12 +4,20 @@
  * State is one object and a poll. Every action on the page ends in a signature
  * from the wallet in this browser, which is why there is no login: the address
  * is the account, and the key never leaves.
+ *
+ * Nothing on this page asks a server what anything is worth. The order book and
+ * the trade history are `swap_offer` and `swap_accept` blocks, read back off the
+ * chains of accounts the registry knows about — so every number here is one two
+ * people signed, and a reader with the same account list gets the same answer
+ * without this site being involved at all.
  */
 
-import { CURVE_SUPPLY, coinsFor, formatCoins, formatKei, parseKei, spotPrice } from '../shared/curve.js'
-import type { Listing, MarketFacts, ReserveLock } from '../shared/listing.js'
+import type { Offer } from 'kei-transaction'
+
+import { formatCoins, formatKei, formatPrice, parseKei } from '../shared/format.js'
+import type { Book, Listing, MarketFacts, TransferPolicy } from '../shared/listing.js'
 import { connect, explain, type Trader } from './market-client.js'
-import { chart, clear, el, lockBadge, multiple, price, progress, stateBadge, summarise } from './ui.js'
+import { chart, clear, el, policyBadge, summarise } from './ui.js'
 
 const POLL_MS = 2_000
 
@@ -17,8 +25,9 @@ interface State {
   facts: MarketFacts | null
   selected: string | null
   kei: bigint
-  holdings: Map<string, bigint>
-  deeds: Set<string>
+  holdings: Map<string, number>
+  books: Map<string, Book>
+  mine: Offer[]
   busy: boolean
   message: { text: string; tone: 'ok' | 'bad' } | null
 }
@@ -28,7 +37,8 @@ const state: State = {
   selected: null,
   kei: 0n,
   holdings: new Map(),
-  deeds: new Set(),
+  books: new Map(),
+  mine: [],
   busy: false,
   message: null,
 }
@@ -59,21 +69,26 @@ async function refresh(): Promise<void> {
     state.facts = facts
     state.selected ??= facts.listings[0]?.asset ?? null
 
-    // Both before reading the wallet, not after. A graduation badge sitting as
-    // an uncollected proof is not in the wallet yet, and coins the market just
-    // minted are a receivable until this wallet signs for them — read first and
-    // the page shows a holder nothing, correctly, about the wrong moment.
-    await trader.collect()
+    // Before reading balances, not after. Coins bought through a settlement are
+    // a receivable until this wallet signs for them (SPEC §5.6.3), and reading
+    // first shows a holder nothing, correctly, about the wrong moment.
     await trader.sync()
 
-    const [kei, holdings, items] = await Promise.all([
+    const [kei, holdings, mine] = await Promise.all([
       trader.keiBalance(),
       trader.holdings(facts.listings.map((listing) => listing.asset)),
-      trader.items(),
+      trader.mine(),
     ])
     state.kei = kei
     state.holdings = holdings
-    state.deeds = new Set(items.map((item) => item.id))
+    state.mine = mine
+
+    // Only the coin being looked at. A book is several chain reads per coin, and
+    // polling all of them every two seconds would make the page the busiest
+    // client on the network for no benefit.
+    if (state.selected) {
+      state.books.set(state.selected, await trader.book(state.selected))
+    }
   } catch (error) {
     say(explain(error), 'bad')
   }
@@ -91,7 +106,7 @@ async function act(what: string, job: () => Promise<void>): Promise<void> {
   render()
   try {
     await job()
-    say(`${what} — signed. Waiting for the market to settle it.`, 'ok')
+    say(`${what} — done.`, 'ok')
   } catch (error) {
     say(explain(error), 'bad')
   } finally {
@@ -100,6 +115,8 @@ async function act(what: string, job: () => Promise<void>): Promise<void> {
     render()
   }
 }
+
+const book = (asset: string): Book | undefined => state.books.get(asset)
 
 // --------------------------------------------------------------------- render
 
@@ -120,7 +137,7 @@ function header(): HTMLElement {
       'div.brand',
       {},
       el('h1', {}, 'Carpet Markets'),
-      el('p', {}, 'Launch a coin. Watch it go up. Read the deed before you buy.'),
+      el('p', {}, 'Launch a coin. Sell it to somebody. Read the transfer policy before you buy.'),
     ),
     el(
       'div.wallet',
@@ -129,20 +146,16 @@ function header(): HTMLElement {
       el('strong', {}, `${formatKei(state.kei, 6)} Kei`),
       el(
         'button.ghost',
-        {
-          onclick: () => void act('Topping up', () => trader.topUp()),
-          disabled: state.busy,
-        },
+        { onclick: () => void act('Topping up', () => trader.topUp()), disabled: state.busy },
         'Faucet',
       ),
-      facts && el('span.network', {}, `${facts.network} · ${facts.issued} assets issued`),
+      facts && el('span.network', {}, `${facts.network} · ${facts.listings.length} coins`),
     ),
   )
 }
 
 function board(): HTMLElement {
-  const facts = state.facts
-  const listings = [...(facts?.listings ?? [])].sort((a, b) => Number(BigInt(b.reserve) - BigInt(a.reserve)))
+  const listings = [...(state.facts?.listings ?? [])].sort((a, b) => b.launchedAt - a.launchedAt)
 
   return el(
     'section.board',
@@ -155,27 +168,24 @@ function board(): HTMLElement {
 }
 
 function card(listing: Listing): HTMLElement {
-  const sold = BigInt(listing.sold)
-  const held = state.holdings.get(listing.asset) ?? 0n
+  const held = state.holdings.get(listing.asset) ?? 0
   return el(
     'button.card',
     {
       class: `card ${listing.asset === state.selected ? 'card-on' : ''}`,
       onclick: () => {
         state.selected = listing.asset
-        render()
+        void refresh().then(render)
       },
     },
-    el(
-      'div.card-top',
-      {},
-      el('strong', {}, listing.symbol),
-      lockBadge(listing),
-      stateBadge(listing) ?? el('span.mult', {}, multiple(sold)),
-    ),
+    el('div.card-top', {}, el('strong', {}, listing.symbol), policyBadge(listing)),
     el('div.card-name', {}, listing.name),
-    el('div.bar', {}, el('div.bar-fill', { style: `width:${Math.min(100, progress(sold))}%` })),
-    el('div.card-foot', {}, summarise(listing), held > 0n ? el('span.held', {}, `you: ${formatCoins(held)}`) : null),
+    el(
+      'div.card-foot',
+      {},
+      summarise(listing, book(listing.asset)),
+      held > 0 ? el('span.held', {}, `you: ${formatCoins(held)}`) : null,
+    ),
   )
 }
 
@@ -185,158 +195,211 @@ function detail(): HTMLElement {
   const listing = state.facts?.listings.find((entry) => entry.asset === state.selected)
   if (!listing) return el('section.detail', {}, el('p.empty', {}, 'Pick a coin.'))
 
-  const sold = BigInt(listing.sold)
-  const held = state.holdings.get(listing.asset) ?? 0n
+  const current = book(listing.asset)
+  const held = state.holdings.get(listing.asset) ?? 0
   const canvas = el('canvas.chart', { width: 640, height: 180 })
-  queueMicrotask(() => chart(canvas, listing.history, listing.state))
+  queueMicrotask(() => chart(canvas, current?.trades ?? []))
 
   return el(
     'section.detail',
     {},
-    el(
-      'div.detail-head',
-      {},
-      el('h2', {}, `${listing.symbol} — ${listing.name}`),
-      lockBadge(listing),
-      stateBadge(listing),
-    ),
+    el('div.detail-head', {}, el('h2', {}, `${listing.symbol} — ${listing.name}`), policyBadge(listing)),
     listing.blurb ? el('p.blurb', {}, listing.blurb) : null,
     canvas,
-    stats(listing, sold, held),
-    listing.state === 'trading' ? trade(listing, held) : closed(listing),
-    deedRow(listing),
+    stats(listing, current, held),
+    listing.transfer === 'open' ? asks(listing, current) : noMarket(listing),
+    listing.transfer === 'open' ? sellForm(listing, held) : null,
+    myOffers(listing),
     provenance(listing),
   )
 }
 
-function stats(listing: Listing, sold: bigint, held: bigint): HTMLElement {
-  const graduation = BigInt(state.facts?.graduation ?? '0')
-  const reserve = BigInt(listing.reserve)
-  const toGo = graduation > reserve ? graduation - reserve : 0n
+function stats(listing: Listing, current: Book | undefined, held: number): HTMLElement {
+  const price = current?.price
   return el(
     'dl.stats',
     {},
-    stat('Price', `${price(spotPrice(sold))} Kei`),
-    stat('Multiple', multiple(sold)),
-    stat('Sold', `${formatCoins(sold)} / ${formatCoins(CURVE_SUPPLY)}`),
-    stat('Reserve', `${formatKei(reserve, 6)} Kei`),
+    stat('Last', price ? `${formatPrice(price.last)} Kei` : 'never traded'),
+    stat('Median', price ? `${formatPrice(price.median)} Kei` : '—'),
+    stat('Range', price ? `${formatPrice(price.low)} – ${formatPrice(price.high)}` : '—'),
+    stat('Trades', price ? String(price.trades) : '0'),
+    stat('Supply', formatCoins(listing.supply)),
     stat('You hold', formatCoins(held)),
-    stat('To graduation', listing.state === 'trading' ? `${formatKei(toGo, 4)} Kei` : '—'),
   )
 }
 
 const stat = (label: string, value: string): HTMLElement =>
   el('div.stat', {}, el('dt', {}, label), el('dd', {}, value))
 
-function trade(listing: Listing, held: bigint): HTMLElement {
-  const spend = el('input.amount', { type: 'text', value: '1', inputmode: 'decimal' })
-  const sell = el('input.amount', { type: 'text', value: held > 0n ? held.toString() : '0', inputmode: 'numeric' })
-  const sold = BigInt(listing.sold)
-
-  const preview = el('p.preview', {})
-  const updatePreview = (): void => {
-    try {
-      const count = coinsFor(sold, parseKei(spend.value))
-      preview.textContent =
-        count > 0n ? `≈ ${formatCoins(count)} ${listing.symbol}` : `Not enough for one ${listing.symbol}.`
-    } catch {
-      preview.textContent = 'That is not an amount of Kei.'
-    }
-  }
-  spend.addEventListener('input', updatePreview)
-  queueMicrotask(updatePreview)
+/**
+ * The offers, cheapest first, each one a button that settles it.
+ *
+ * Accepting is one block that moves both legs (SPEC §9.2). There is no window in
+ * which this wallet has paid and not been paid — the ledger has no state in
+ * which half of it happened.
+ */
+function asks(listing: Listing, current: Book | undefined): HTMLElement {
+  const open = (current?.asks ?? []).filter((offer) => !offer.mine)
+  const own = (current?.asks ?? []).filter((offer) => offer.mine)
 
   return el(
-    'div.trade',
+    'div.book',
     {},
+    el('h3', {}, 'For sale'),
+    open.length === 0
+      ? el(
+          'p.empty',
+          {},
+          own.length > 0
+            ? 'Only your own offers are open. Somebody else has to take them.'
+            : 'Nobody is selling. Whoever holds this can list some at a price of their choosing.',
+        )
+      : el(
+          'table.asks',
+          {},
+          el(
+            'tr',
+            {},
+            el('th', {}, 'Amount'),
+            el('th', {}, 'Price each'),
+            el('th', {}, 'Total'),
+            el('th', {}, ''),
+          ),
+          ...open.map((offer) => askRow(listing, offer)),
+        ),
+  )
+}
+
+function askRow(listing: Listing, offer: Offer): HTMLElement {
+  return el(
+    'tr',
+    {},
+    el('td', {}, formatCoins(offer.give.amount)),
+    el('td', {}, `${formatPrice(offer.price)} Kei`),
+    el('td', {}, `${formatPrice(offer.want.amount)} Kei`),
     el(
-      'div.side',
+      'td',
       {},
-      el('label', {}, 'Spend (Kei)'),
-      spend,
-      preview,
       el(
         'button.buy',
         {
           disabled: state.busy,
           onclick: () =>
-            void act(`Buying ${listing.symbol}`, async () => {
-              await trader.buy(listing.asset, parseKei(spend.value))
+            void act(`Buying ${formatCoins(offer.give.amount)} ${listing.symbol}`, async () => {
+              await trader.accept(offer.hash)
             }),
         },
         'Buy',
       ),
     ),
+  )
+}
+
+function noMarket(listing: Listing): HTMLElement {
+  return el(
+    'div.closed',
+    {},
+    listing.transfer === 'none'
+      ? 'Soulbound. These units cannot move, so there is no offer anybody could write and no market that could exist. That is not this site declining to host one — it is an invalid block.'
+      : 'Issuer-only. Units move only to or from the issuing account, so no offer between two holders is valid. Whatever market this coin has, the issuer is the whole of it.',
+  )
+}
+
+/**
+ * List some for sale: how many, and what to ask for each.
+ *
+ * Both numbers belong to the seller, which is the entire difference from the
+ * bonding curve this used to have. Somebody holding the supply can put out a
+ * thousand at a time and keep the price up, or all of it at once and not — and
+ * the point of the example is that a buyer can watch them choose.
+ */
+function sellForm(listing: Listing, held: number): HTMLElement {
+  const amount = el('input.amount', { type: 'text', value: '1000', inputmode: 'numeric' })
+  const unit = el('input.amount', { type: 'text', value: '0.0002', inputmode: 'decimal' })
+  const preview = el('p.preview', {})
+
+  const update = (): void => {
+    const count = Number(amount.value.replace(/[^\d]/g, '') || '0')
+    const each = Number(unit.value)
+    preview.textContent =
+      count > 0 && Number.isFinite(each) && each > 0
+        ? `Asking ${formatPrice(count * each)} Kei for the lot.`
+        : 'Pick a whole number of coins and a price above zero.'
+  }
+  amount.addEventListener('input', update)
+  unit.addEventListener('input', update)
+  queueMicrotask(update)
+
+  return el(
+    'div.trade',
+    {},
+    el('div.side', {}, el('label', {}, `Sell (${listing.symbol})`), amount),
+    el('div.side', {}, el('label', {}, 'Price each (Kei)'), unit),
     el(
       'div.side',
       {},
-      el('label', {}, `Sell (${listing.symbol})`),
-      sell,
+      preview,
       el('p.preview', {}, `You hold ${formatCoins(held)}.`),
       el(
         'button.sell',
         {
-          disabled: state.busy || held <= 0n,
+          disabled: state.busy || held <= 0,
           onclick: () =>
-            void act(`Selling ${listing.symbol}`, async () => {
-              const count = BigInt(sell.value.replace(/[^\d]/g, '') || '0')
-              if (count <= 0n) throw new Error('Sell a whole number of coins, more than zero.')
-              await trader.sell(listing.asset, count > held ? held : count)
+            void act(`Listing ${listing.symbol}`, async () => {
+              const count = Number(amount.value.replace(/[^\d]/g, '') || '0')
+              const each = Number(unit.value)
+              if (count <= 0) throw new Error('Sell a whole number of coins, more than zero.')
+              if (count > held) throw new Error(`You hold ${formatCoins(held)}, so you cannot list ${formatCoins(count)}.`)
+              if (!Number.isFinite(each) || each <= 0) throw new Error('Price each has to be above zero.')
+              await trader.sell(listing.asset, count, each)
             }),
         },
-        'Sell',
+        'List them',
       ),
     ),
   )
 }
 
-function closed(listing: Listing): HTMLElement {
-  return el(
-    'div.closed',
-    {},
-    listing.state === 'graduated'
-      ? 'Graduated. The curve is closed and the reserve is locked for good — nobody can empty it, including whoever holds the deed. It trades between players now, because its transfer policy always said it could.'
-      : 'Rugged. Someone sent the deed back and the market paid them the entire reserve, exactly as the deed said it would. The coins still exist and are still yours. Nothing will buy them.',
-  )
-}
+/**
+ * This wallet's own open offers.
+ *
+ * Worth showing because the coins in them are gone from the spendable balance
+ * until the offer settles or is cancelled — locked by the `swap_offer` block,
+ * not by bookkeeping here. A holder who cannot find their coins is looking at
+ * this list.
+ */
+function myOffers(listing: Listing): HTMLElement | null {
+  const mine = state.mine.filter((offer) => offer.give.asset === listing.asset)
+  if (mine.length === 0) return null
 
-function deedRow(listing: Listing): HTMLElement | null {
-  if (!state.deeds.has(listing.deed)) return null
-
-  const dead = listing.state !== 'trading'
   return el(
-    'div.deed',
+    'div.mine',
     {},
-    el('span', {}, 'You hold the deed to this coin.'),
-    listing.lock === 'carpet'
-      ? el(
-          'button.rug',
+    el('h3', {}, 'Your open offers'),
+    ...mine.map((offer) =>
+      el(
+        'div.offer',
+        {},
+        el('span', {}, `${formatCoins(offer.give.amount)} at ${formatPrice(offer.price)} Kei each`),
+        el(
+          'button.ghost',
           {
-            disabled: state.busy || dead,
-            onclick: () =>
-              void act(`Pulling the carpet on ${listing.symbol}`, async () => {
-                await trader.rug(listing.deed)
-              }),
-          },
-          dead ? 'Nothing left to pull' : `Pull the carpet — take ${formatKei(BigInt(listing.reserve), 4)} Kei`,
-        )
-      : el(
-          'button.rug',
-          {
-            // Left enabled on purpose. The refusal is worth seeing, and it comes
-            // from the ledger rather than from this button being greyed out.
             disabled: state.busy,
-            onclick: () =>
-              void act(`Trying to pull the carpet on ${listing.symbol}`, async () => {
-                await trader.rug(listing.deed)
-              }),
+            onclick: () => void act('Cancelling', () => trader.cancel(offer.hash)),
           },
-          'Try to pull the carpet',
+          'Cancel',
         ),
+      ),
+    ),
   )
 }
 
 function provenance(listing: Listing): HTMLElement {
+  const policy: Record<TransferPolicy, string> = {
+    open: 'open — anybody can send it to anybody, including all of it to you',
+    'issuer-only': 'issuer-only — units move only to or from the issuing account',
+    none: 'none — soulbound, nothing moves',
+  }
   return el(
     'details.provenance',
     {},
@@ -345,14 +408,14 @@ function provenance(listing: Listing): HTMLElement {
       'dl',
       {},
       stat('Coin asset', listing.asset),
-      stat('Deed asset', listing.deed),
-      stat('Deed transfer policy', listing.lock === 'carpet' ? 'open — the reserve can leave' : 'none — soulbound'),
+      stat('Issued by', listing.issuer),
+      stat('Transfer policy', policy[listing.transfer]),
       stat('Launched by', listing.creator),
     ),
     el(
       'p',
       {},
-      'The transfer policy is fixed at issuance and enforced by consensus, not by this market. It is the reason the badge above is a fact rather than a promise.',
+      'The transfer policy is fixed at issuance and enforced by consensus, not by this site. It is the reason the badge above is a fact rather than a promise. Every coin here is issued by an account of its own, so the burn one launch pays is its own first one and never anybody else’s.',
     ),
   )
 }
@@ -360,36 +423,34 @@ function provenance(listing: Listing): HTMLElement {
 // --------------------------------------------------------------------- launch
 
 function launchButton(): HTMLElement {
-  const fee = BigInt(state.facts?.launchFee ?? '0')
+  const fee = state.facts?.launchFee ?? '0'
   return el(
     'button.launch',
     { disabled: state.busy, onclick: () => openLaunch(fee) },
-    `Launch a coin — ${formatKei(fee, 2)} Kei`,
+    `Launch a coin — ${formatKei(parseKei(fee), 2)} Kei`,
   )
 }
 
-function openLaunch(fee: bigint): void {
+function openLaunch(fee: string): void {
   const symbol = el('input', { type: 'text', placeholder: 'WAGMI', maxlength: 10 })
   const name = el('input', { type: 'text', placeholder: 'We Are All Gonna Make It' })
   const blurb = el('input', { type: 'text', placeholder: 'One line. 140 characters.', maxlength: 140 })
-  let lock: ReserveLock = 'nailed-down'
+  let transfer: TransferPolicy = 'open'
 
-  const choice = (value: ReserveLock, title: string, body: string): HTMLElement => {
-    const button = el(
+  const choice = (value: TransferPolicy, title: string, body: string): HTMLElement =>
+    el(
       'button',
       {
-        class: `choice ${lock === value ? 'choice-on' : ''}`,
-        onclick: () => {
-          lock = value
+        class: `choice ${transfer === value ? 'choice-on' : ''}`,
+        onclick: (event: Event) => {
+          transfer = value
           for (const other of dialog.querySelectorAll('.choice')) other.classList.remove('choice-on')
-          button.classList.add('choice-on')
+          ;(event.currentTarget as HTMLElement).classList.add('choice-on')
         },
       },
       el('strong', {}, title),
       el('span', {}, body),
     )
-    return button
-  }
 
   const dialog = el(
     'div.sheet',
@@ -398,8 +459,8 @@ function openLaunch(fee: bigint): void {
     el(
       'p.fee',
       {},
-      `This costs ${formatKei(fee, 4)} Kei and most of it is burned, not collected. `,
-      `The market has issued ${String(state.facts?.issued ?? 0)} assets and the nth burns n Kei, so the next coin always costs more than the last one. That is what stops this place filling with junk.`,
+      `This costs ${formatKei(parseKei(fee), 4)} Kei and almost all of it is burned, not collected. `,
+      'It is the same for everybody and does not go up as more coins are listed: each one is issued by a fresh account, so a launch pays that account’s first burn and nothing else.',
     ),
     el('label', {}, 'Symbol'),
     symbol,
@@ -407,19 +468,24 @@ function openLaunch(fee: bigint): void {
     name,
     el('label', {}, 'Blurb'),
     blurb,
-    el('label', {}, 'The deed'),
+    el('label', {}, 'Who may move it'),
     el(
       'div.choices',
       {},
       choice(
-        'nailed-down',
-        'Nailed down',
-        'The deed is soulbound. The reserve cannot be taken by anyone, ever, including you. Enforced by the chain.',
+        'open',
+        'Open',
+        'Anybody can trade it, so it has a real order book. You are minted the whole supply and nothing stops you selling it into that book at any pace you like. Buyers can see this before they buy.',
       ),
       choice(
-        'carpet',
-        'Carpet',
-        'The deed transfers. Send it back to the market and the whole reserve is yours. Buyers can see this before they buy.',
+        'issuer-only',
+        'Issuer only',
+        'Units move only to or from the issuing account. No offer between two holders is a valid block, so there is no player-to-player market and cannot be one.',
+      ),
+      choice(
+        'none',
+        'Soulbound',
+        'Nothing moves, ever. It cannot be sold, by you or by anybody. Enforced by the chain, immutably, from issuance.',
       ),
     ),
     el(
@@ -435,7 +501,7 @@ function openLaunch(fee: bigint): void {
                 symbol: symbol.value,
                 name: name.value,
                 blurb: blurb.value,
-                lock,
+                transfer,
               })
               dialog.remove()
             }),
