@@ -1,0 +1,92 @@
+@import 'tailwindcss';
+
+/**
+ * The palette is Kei's, not a framework's: the gold is the coin, and it was the
+ * accent in this demo before there was a Tailwind in the project. Green and red
+ * are spent only on direction — a price that went up, a policy that can hurt you
+ * — so that nothing decorative competes with the two colours that mean something.
+ *
+ * There is no webfont. This is a static export served off a Worker, and a board
+ * of tickers and hashes reads better in the system grotesque with a real
+ * monospace for every figure than in anything that has to be downloaded first.
+ */
+@theme {
+  --color-floor: #0a0c0f;
+  --color-panel: #121619;
+  --color-raised: #171c21;
+  --color-line: #232a31;
+  --color-line-bright: #333d47;
+  --color-ink: #e8eef4;
+  --color-dim: #8b97a3;
+  --color-fainter: #626d78;
+
+  --color-gold: #e3b341;
+  --color-gold-deep: #16130a;
+  --color-up: #6ee787;
+  --color-down: #ff6b6b;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, 'SFMono-Regular', 'Cascadia Mono', Menlo, monospace;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: var(--color-floor);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Figures on a trading board must not reflow as they tick. */
+  .tabular,
+  input[inputmode='numeric'],
+  input[inputmode='decimal'] {
+    font-variant-numeric: tabular-nums;
+  }
+
+  ::selection {
+    background: var(--color-gold);
+    color: var(--color-gold-deep);
+  }
+
+  /* Dark, thin, and out of the way — the board is dense enough. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line-bright) transparent;
+  }
+}
+
+@layer components {
+  /**
+   * The one interaction that costs real money gets the gold. Everything else is
+   * an outline, so there is never a moment where two things on screen look
+   * equally like the button you meant.
+   */
+  .btn,
+  .btn-gold,
+  .btn-quiet {
+    @apply inline-flex items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition-colors;
+    @apply disabled:cursor-not-allowed disabled:opacity-40;
+  }
+
+  .btn-gold {
+    @apply border-gold bg-gold text-gold-deep hover:bg-[#efc45c];
+  }
+
+  .btn-quiet {
+    @apply border-line bg-raised text-ink hover:border-line-bright;
+  }
+
+  .panel {
+    @apply rounded-lg border border-line bg-panel;
+  }
+
+  /* Uppercase micro-labels, the way an instrument panel labels a dial. */
+  .eyebrow {
+    @apply font-mono text-[10px] uppercase tracking-[0.14em] text-fainter;
+  }
+}

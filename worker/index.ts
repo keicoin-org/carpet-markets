@@ -20,7 +20,9 @@ import { DurableObject } from 'cloudflare:workers'
 import { MockNode, mockRpcHandler, randomSeed } from 'kei-transaction'
 
 import { ListingError } from '../shared/listing.js'
+import { ReplyError } from '../shared/social.js'
 import { RegistryError, startRegistry, type Registry } from '../server/registry.js'
+import { Threads, type PostReply } from '../server/social.js'
 
 interface Env {
   ASSETS: Fetcher
@@ -40,6 +42,15 @@ function apiPath(url: URL): string | null {
 export class Floor extends DurableObject<Env> {
   #booting: Promise<{ registry: Registry; rpc: (request: Request) => Promise<Response> }> | undefined
 
+  /**
+   * The reply threads, in memory beside the chain and lost with it.
+   *
+   * They are not persisted to the object's storage on purpose. A thread that
+   * outlived the coins it is about would be a wall of comments on assets that no
+   * longer exist, which is a worse artefact than an empty page.
+   */
+  readonly #threads = new Threads()
+
   /** One chain and one registry, built on the first request and kept. */
   #ready(): Promise<{ registry: Registry; rpc: (request: Request) => Promise<Response> }> {
     this.#booting ??= (async () => {
@@ -48,6 +59,7 @@ export class Floor extends DurableObject<Env> {
         seed: this.env.CARPET_SEED ?? randomSeed(),
         node,
         network: 'mock',
+        replyCount: (asset) => this.#threads.count(asset),
       })
       return { registry, rpc: mockRpcHandler({ node }) }
     })()
@@ -71,6 +83,18 @@ export class Floor extends DurableObject<Env> {
         case '/market/book':
           return json(await registry.book(url.searchParams.get('asset') ?? ''))
 
+        case '/market/holders':
+          return json({ holders: await registry.holders(url.searchParams.get('asset') ?? '') })
+
+        case '/market/replies':
+          return json({ replies: this.#threads.list(url.searchParams.get('asset') ?? '') })
+
+        case '/market/reply': {
+          const body = await read<PostReply>(request)
+          if (!registry.listing(body.asset)) throw new ListingError('That coin is not listed here.')
+          return json(await this.#threads.add(body))
+        }
+
         case '/market/launch': {
           const body = await read<{ address: string } & Record<string, unknown>>(request)
           return json(await registry.quoteLaunch(body.address, body))
@@ -87,7 +111,8 @@ export class Floor extends DurableObject<Env> {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      return json({ error: message }, error instanceof ListingError || error instanceof RegistryError ? 400 : 500)
+      const theirs = error instanceof ListingError || error instanceof RegistryError || error instanceof ReplyError
+      return json({ error: message }, theirs ? 400 : 500)
     }
   }
 }

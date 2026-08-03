@@ -11,8 +11,14 @@ the example of it.
 
 ```sh
 bun install
-bun run dev          # http://localhost:7788
+bun run dev          # client on :3000, chain and registry on :7788
 ```
+
+The client is Next.js and ships as a **static export** — plain HTML, CSS and JS
+with no Node server behind it. `next dev` proxies `/rpc` and `/market/*` to the
+Bun process on :7788; the deployed copy has no proxy at all, because there a
+Cloudflare Worker serves the exported files and answers those two paths out of a
+Durable Object.
 
 > **This is a demo.** The chain underneath is an in-memory mock served by the
 > same process. It dies when you stop the server, every coin you can launch on it
@@ -90,16 +96,29 @@ anybody else's. Spam is still bounded, per launcher, exactly as the spec intende
 ```
 shared/format.ts      turning numbers into text. Used to be the bonding curve.
 shared/listing.ts     the wire shape, and what a valid coin identity is.
+shared/social.ts      replies, and the signature that makes one attributable.
 server/registry.ts    issues coins, and remembers who to read. The whole backend.
-server/main.ts        one Bun server: the mock node at /rpc, the registry at /market/*, the client at /
-src/market-client.ts  every line of Kei in the client.
-src/main.ts           the market floor.
-src/ui.ts             elements and the chart.
+server/main.ts        the mock node at /rpc and the registry at /market/*.
+worker/index.ts       the same two, on Cloudflare, in one Durable Object.
+lib/market.ts         every line of Kei in the client.
+lib/use-market.tsx    the wallet, the poll, and where React finds out about them.
+app/page.tsx          the board.
+app/coin/page.tsx     one coin: chart, book, holders, replies.
+app/launch/page.tsx   the three-way choice the whole example is about.
+components/           the board's parts, including the woven coin marks.
 ```
 
-`src/market-client.ts` is the file to read if you are here to learn
-`@keicoin/market`. `server/registry.ts` is the file to read if you are here to
-learn what a server still has to do when it is not allowed to touch the money.
+`lib/market.ts` is the file to read if you are here to learn `@keicoin/market`.
+`server/registry.ts` is the file to read if you are here to learn what a server
+still has to do when it is not allowed to touch the money.
+
+### The coin art is derived, not uploaded
+
+Launchpads in this shape get their density from an image per coin, which means an
+upload, a pinning service, a bucket and a moderation problem. Here the asset id
+seeds a small mirrored kilim, so the same coin draws the same rug everywhere and
+nothing is stored anywhere. It is in `components/CoinArt.tsx` and it is about
+sixty lines.
 
 ## What the server is, and is not
 
@@ -134,8 +153,8 @@ Written down because each one cost an afternoon.
 - **`sell({ amount, price })` takes the total ask, not the price each.** The
   `Offer` that comes back reports `price` *per unit*, so the two differ by
   `amount`. Getting it backwards mislists by several orders of magnitude on a
-  coin with a million units. `src/market-client.ts` multiplies in one place for
-  exactly this reason.
+  coin with a million units. `lib/market.ts` multiplies in one place for exactly
+  this reason.
 - **`market.price()` defaults to your own trades.** Pass `{ from }` or a wallet
   that has never traded summarises nothing and returns null, which reads like the
   coin has no history.
@@ -163,6 +182,13 @@ Written down because each one cost an afternoon.
 - **The registry keeps unmatched payments.** Send it Kei answering no quote and
   it stays there. Reflexively refunding whoever sends money would make it return
   its own working capital to the faucet on startup.
+- **The replies are not on the chain**, and they are the only thing here that is
+  not. The registry stores them and the registry can lose them; they go when the
+  chain does. What they do carry is a signature from the same key that signs
+  their author's blocks, so nobody can post as the creator — which is a strictly
+  weaker claim than a block makes, and the panel says so rather than letting the
+  word "signed" imply consensus. In a genre where *dev said he's not selling* is
+  load-bearing, being able to prove only who said it is still worth having.
 - **A creator selling their whole position is not an exploit.** It is the
   documented behaviour of `transfer: 'open'`. If you would like it to be
   impossible, that is the other radio button, and it is impossible at the ledger
@@ -179,5 +205,10 @@ marketing. It asserts at the ledger that a soulbound coin cannot be offered at
 all, that an issuer-only coin cannot be traded between two holders, that an open
 one settles peer-to-peer in whatever size the seller chose, and that the launch
 fee does not move as coins pile up.
+
+`test/social.test.ts` covers the other claim the UI makes — that the address on a
+reply wrote it. Every test in it is a way of trying to post as somebody else:
+forging the author, editing the body after signing, lifting a signed reply onto
+another coin, and sending the same one twice.
 
 MIT.
