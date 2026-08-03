@@ -101,16 +101,41 @@ server/registry.ts    issues coins, and remembers who to read. The whole backend
 server/main.ts        the mock node at /rpc and the registry at /market/*.
 worker/index.ts       the same two, on Cloudflare, in one Durable Object.
 lib/market.ts         every line of Kei in the client.
+lib/balance.ts        confirmed, incoming and in-flight money, kept apart.
 lib/use-market.tsx    the wallet, the poll, and where React finds out about them.
 app/page.tsx          the board.
 app/coin/page.tsx     one coin: chart, book, holders, replies.
 app/launch/page.tsx   the three-way choice the whole example is about.
 components/           the board's parts, including the woven coin marks.
+spawn.ts              running a command on an OS that disagrees what one is.
 ```
 
 `lib/market.ts` is the file to read if you are here to learn `@keicoin/market`.
 `server/registry.ts` is the file to read if you are here to learn what a server
 still has to do when it is not allowed to touch the money.
+
+### A balance is three numbers, and only one of them can be spent
+
+A block-lattice wallet has three, where a bank account has one, and the gaps
+between them are exactly the moments somebody is watching the screen:
+
+| | |
+|---|---|
+| **Confirmed** | Signed for, on this wallet's chain, spendable this instant. The ledger checks a spend against this and nothing else. |
+| **Incoming** | Sent to this wallet and not yet received by it. Real, owed, and not spendable — a receivable becomes a balance when the holder's own key signs for it (SPEC §5.6.3), which is what `sync()` does. |
+| **In flight** | Signed by this browser a moment ago and not yet visible in a balance read. Nothing disagrees with it; the two-second poll simply has not come back. |
+
+Showing only the first makes the page look broken for two seconds after every
+trade. Adding them together makes it offer money that cannot move, and the
+ledger then refuses with "balance is 0", which reads like a bug in the market
+rather than the market working. So they are carried separately all the way to
+the screen: the bar shows what is spendable, and says what is settling beside
+it rather than inside it.
+
+The rule the whole of `lib/balance.ts` exists to hold is that only `spendable`
+is ever allowed near a decision. A credit in flight moves the display and never
+funds the next spend; a debit is counted the moment it is signed, so two clicks
+in the same second cannot both be checked against the same coins.
 
 ### The coin art is derived, not uploaded
 
@@ -165,6 +190,11 @@ Written down because each one cost an afternoon.
 - **Minted coins are a receivable, not a balance.** They are owed until the
   recipient's wallet signs for them. Selling before `sync()` fails with
   "balance is 0", which is correct and reads like a bug in the market.
+- **`Offer.mine` answers for whoever did the reading.** The SDK sets it to
+  `from === client.address`, and the offers in `/market/book` were read by the
+  registry's wallet — so it is `false` on every row in that book, including
+  yours. A client filtering on it removes nothing and offers people their own
+  coins back. Compare `offer.from` to the browser wallet's own address instead.
 
 ## Honest about what this is not
 
@@ -194,6 +224,28 @@ Written down because each one cost an afternoon.
   impossible, that is the other radio button, and it is impossible at the ledger
   rather than here.
 
+## Building on Windows
+
+`bun run build` shells out to `next build`, and that spawn is the one thing here
+that does not survive the platform. `Bun.spawn` does not go through a shell, so
+a bare `bunx` is resolved by libuv's own PATH walk — which does not apply
+`PATHEXT`, and therefore looks for a file called exactly `bunx`. An npm global
+install puts one there: a POSIX shell script, sitting beside the `bunx.cmd` that
+Windows can actually run. libuv finds the script, cannot start it, and the build
+dies with `uv_spawn 'bunx' ENOENT` while `bunx next build` typed at the same
+prompt works perfectly.
+
+`spawn.ts` stops asking PATH about the one thing the process already holds a
+path to. `process.execPath` is the Bun binary running the build and `bunx` is an
+alias for `bun x`, so both become an absolute executable and an argument list
+with no lookup at all. Anything else is searched across PATH the way the shell
+would search it: `PATHEXT` order first so a real executable wins over an
+extensionless script of the same name, and a `.cmd` or `.bat` handed to the
+command interpreter, because `CreateProcess` refuses a script.
+
+`build.ts` and `dev.ts` both go through it, and a command that genuinely is not
+installed now fails saying which one, rather than as an errno from libuv.
+
 ## Checks
 
 ```sh
@@ -210,5 +262,16 @@ fee does not move as coins pile up.
 reply wrote it. Every test in it is a way of trying to post as somebody else:
 forging the author, editing the body after signing, lifting a signed reply onto
 another coin, and sending the same one twice.
+
+`test/balance.test.ts` is the rule above in assertions: whatever is arriving or
+halfway out, `spendable` never counts anything the chain has not confirmed.
+
+`test/format.test.ts` holds down the price formatter, which was rendering every
+price below a millionth in exponent notation — `6.00e-7` — which is the exact
+output it exists to prevent, on exactly the range a new coin trades in.
+
+`test/spawn.test.ts` is the Windows build blocker. It fakes a filesystem and a
+PATH rather than reading the host's, because the bug appears on one platform and
+CI runs on another, and the point is that the rule is checked from either.
 
 MIT.

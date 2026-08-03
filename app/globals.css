@@ -18,7 +18,14 @@
   --color-line-bright: #333d47;
   --color-ink: #e8eef4;
   --color-dim: #8b97a3;
-  --color-fainter: #626d78;
+  /**
+   * The quiet one, and the only colour here chosen by arithmetic rather than by
+   * eye. It was #626d78, which is 3.3:1 on `raised` — and everything wearing it
+   * is a 10px eyebrow or a micro-label, so the large-text allowance it might
+   * have qualified for does not apply to a single one of them. This clears 4.5:1
+   * on floor, panel and raised alike, and is still a clear step below `dim`.
+   */
+  --color-fainter: #7a8794;
 
   --color-gold: #e3b341;
   --color-gold-deep: #16130a;
@@ -51,6 +58,20 @@
   ::selection {
     background: var(--color-gold);
     color: var(--color-gold-deep);
+  }
+
+  /**
+   * One focus ring, everywhere, in the accent colour.
+   *
+   * The inputs used to signal focus by brightening their own border, which is a
+   * 1px change of about 1.4:1 against the panel behind it — visible if you knew
+   * to look for it and invisible if you are tabbing. `:focus-visible` keeps it
+   * off the mouse path, so it costs the pointer user nothing.
+   */
+  :focus-visible {
+    outline: 2px solid var(--color-gold);
+    outline-offset: 2px;
+    border-radius: 2px;
   }
 
   /* Dark, thin, and out of the way — the board is dense enough. */

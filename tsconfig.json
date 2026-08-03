@@ -46,6 +46,8 @@
     "shared",
     "test",
     "build.ts",
+    "dev.ts",
+    "spawn.ts",
     "next-env.d.ts",
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts"

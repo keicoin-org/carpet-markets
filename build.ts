@@ -13,17 +13,28 @@
 import { cp, mkdir, readdir, rm, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
+import { CommandNotFound, runSync } from './spawn.js'
+
 const root = Bun.fileURLToPath(new URL('.', import.meta.url))
 const out = join(root, 'dist', 'examples', 'carpet-markets')
 
-const next = Bun.spawnSync({
-  cmd: ['bunx', 'next', 'build'],
-  cwd: root,
-  env: { ...process.env, NEXT_EXPORT: '1' },
-  stdout: 'inherit',
-  stderr: 'inherit',
-})
-if (next.exitCode !== 0) process.exit(next.exitCode ?? 1)
+// `bunx` by name is the one thing here that does not survive Windows — see
+// `spawn.ts`, which turns it back into the Bun binary already running this.
+const built = build()
+if (built !== 0) process.exit(built)
+
+function build(): number {
+  try {
+    return runSync(['bunx', 'next', 'build'], {
+      cwd: root,
+      env: { ...process.env, NEXT_EXPORT: '1' },
+    })
+  } catch (error) {
+    if (!(error instanceof CommandNotFound)) throw error
+    console.error(`\n  ${error.message}\n`)
+    return 1
+  }
+}
 
 await mkdir(out, { recursive: true })
 for (const entry of await readdir(out)) {

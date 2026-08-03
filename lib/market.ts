@@ -17,7 +17,7 @@
  * out that any of this happened.
  */
 
-import { keyPairFromSeed, signHash } from '@keicoin/core'
+import { KEI_ASSET, keyPairFromSeed, signHash } from '@keicoin/core'
 import {
   defaultSeedStore,
   Kei,
@@ -54,8 +54,16 @@ export interface Trader {
    * confusing. Call this before reading balances, always.
    */
   sync(): Promise<void>
-  /** Raw Kei this wallet holds. */
+  /** Raw Kei this wallet holds. Confirmed: signed for, and spendable. */
   keiBalance(): Promise<bigint>
+  /**
+   * What has been sent to this wallet and not yet signed for.
+   *
+   * The other half of `sync()`, and the reason the balance above is not the
+   * whole story. Read rather than inferred, so the page can say how much is on
+   * its way without pretending it is already spendable.
+   */
+  incoming(): Promise<{ kei: bigint; arrivals: number }>
   facts(): Promise<MarketFacts>
   /** The order book and trade history for one coin. */
   book(asset: string): Promise<Book>
@@ -114,6 +122,23 @@ export async function connect(): Promise<Trader> {
       // Read raw off the account rather than through `balance()`, which answers
       // in a JS number and cannot hold eighteen decimal places.
       return BigInt(await kei.client.node.accountInfo(kei.address).then((info) => info?.balance ?? '0'))
+    },
+
+    /**
+     * Raw again, and for the same reason: this number is added to a balance and
+     * shown beside it, so rounding it through a double would make the two
+     * disagree by a dust amount on screen.
+     *
+     * Coin arrivals are counted but not summed. A count of assets is a number
+     * that means something; a total across two different coins is not.
+     */
+    async incoming() {
+      const waiting = await kei.client.node.receivables(kei.address)
+      const raw = waiting.reduce(
+        (total, arrival) => (arrival.asset === KEI_ASSET ? total + BigInt(arrival.amount) : total),
+        0n,
+      )
+      return { kei: raw, arrivals: waiting.length }
     },
 
     facts: () => get<MarketFacts>('market/facts'),

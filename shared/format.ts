@@ -37,6 +37,26 @@ export function parseKei(text: string): bigint {
   return BigInt(whole) * KEI_RAW + BigInt(fraction.padEnd(18, '0'))
 }
 
+/**
+ * A Kei amount that arrived as a JS number, as raw.
+ *
+ * Prices cross the wire as doubles — `shared/listing.ts` says why, and says
+ * that no balance is allowed to. Eighteen places is as far as one can be
+ * trusted, and not quite that far: the double nearest 1.1 is a hair *above*
+ * 1.1, so this answers 1.1 plus 89 attoKei rather than exactly 1.1. The drift
+ * is in the eighteenth decimal place either way, which is far below anything a
+ * balance is quoted in — so a total converted here cannot become affordable by
+ * rounding, which is the only direction that would matter.
+ */
+export function rawOfKei(amount: number): bigint {
+  if (!Number.isFinite(amount) || amount <= 0) return 0n
+  // `toFixed` gives up and returns exponent notation at 1e21, which `parseKei`
+  // rightly refuses. Nothing here trades at 10^21 Kei, but a total is a product
+  // of two numbers a stranger chose, so it is not this function's place to assume.
+  if (amount >= 1e21) return BigInt(Math.round(amount)) * KEI_RAW
+  return parseKei(amount.toFixed(18))
+}
+
 /** `1234567` → `1,234,567`. Coins have no decimals, so there is nothing else to do. */
 export function formatCoins(count: number): string {
   return Math.trunc(count).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')
@@ -51,8 +71,23 @@ export function formatCoins(count: number): string {
  */
 export function formatPrice(kei: number): string {
   if (!Number.isFinite(kei) || kei <= 0) return '0'
-  if (kei >= 1) return kei.toFixed(4).replace(/\.?0+$/, '')
-  return kei.toPrecision(3).replace(/\.?0+$/, '')
+  if (kei >= 1) return trim(kei.toFixed(4))
+
+  // Three significant figures, written out in full. `toPrecision` was doing the
+  // significant figures and then handing back `6.00e-7` below a millionth,
+  // which is the exact rendering this function exists to prevent — and it is
+  // the range a coin trades in for as long as anybody is still deciding about
+  // it, so the one price worth reading carefully was the one in exponent form.
+  const places = Math.min(KEI_PLACES, 2 - Math.floor(Math.log10(kei)))
+  return trim(kei.toFixed(places))
+}
+
+/** Kei has eighteen decimal places, so there is no seeing past the eighteenth. */
+const KEI_PLACES = 18
+
+/** Trailing zeros, and the decimal point if they were all that followed it. */
+function trim(text: string): string {
+  return text.includes('.') ? text.replace(/0+$/, '').replace(/\.$/, '') : text
 }
 
 /**
