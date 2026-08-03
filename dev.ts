@@ -9,17 +9,21 @@
  * Ctrl-C has to reach both, or the next run finds :7788 still held.
  */
 
+import { resolveSpawn } from './spawn.js'
+
 const root = Bun.fileURLToPath(new URL('.', import.meta.url))
 
+// Both of these are spawned by name, and a name is not a thing Windows can
+// start — `spawn.ts` is the whole explanation.
 const api = Bun.spawn({
-  cmd: ['bun', 'run', 'server/main.ts'],
+  cmd: resolveSpawn(['bun', 'run', 'server/main.ts']),
   cwd: root,
   stdout: 'inherit',
   stderr: 'inherit',
 })
 
 const client = Bun.spawn({
-  cmd: ['bunx', 'next', 'dev'],
+  cmd: resolveSpawn(['bunx', 'next', 'dev']),
   cwd: root,
   stdout: 'inherit',
   stderr: 'inherit',

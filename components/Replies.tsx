@@ -99,8 +99,9 @@ export function Replies({
           onKeyDown={(event) => {
             if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && draft.trim()) post()
           }}
+          aria-label={`Reply about ${listing.symbol}. Signed with your wallet key.`}
           placeholder="Say something. It will be signed with your wallet key."
-          className="w-full resize-y rounded-md border border-line bg-floor px-2.5 py-2 text-xs placeholder:text-fainter focus:border-line-bright focus:outline-none"
+          className="w-full resize-y rounded-md border border-line bg-floor px-2.5 py-2 text-xs placeholder:text-fainter focus:border-line-bright"
         />
         <div className="mt-1.5 flex items-center justify-between gap-2">
           <span className="font-mono text-[10px] text-fainter tabular">

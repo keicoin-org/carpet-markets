@@ -38,9 +38,19 @@ export default function CoinPage() {
 
 function Coin() {
   const asset = useSearchParams().get('asset')
-  const { trader, holdings } = useMarket()
+  const { trader, holdings, loading: boardLoading } = useMarket()
   const listing = useListing(asset)
-  const { book, holders, replies, reload } = useCoin(asset)
+  const { book, holders, replies, loading, reload } = useCoin(asset)
+
+  // "Not listed" and "not read yet" are different sentences, and saying the
+  // first while the second is true is how a working link reads as a dead one.
+  if (!listing && boardLoading && asset) {
+    return (
+      <p className="py-16 text-center text-sm text-fainter" role="status">
+        Reading the board…
+      </p>
+    )
+  }
 
   if (!listing) {
     return (
@@ -97,7 +107,7 @@ function Coin() {
             <Stat label="Open asks" value={String(book?.asks.length ?? 0)} />
           </dl>
 
-          <TradePanel listing={listing} book={book} held={held} onTraded={() => void reload()} />
+          <TradePanel listing={listing} book={book} held={held} loading={loading} onTraded={() => void reload()} />
           <MyOffers listing={listing} onTraded={() => void reload()} />
           <Replies listing={listing} replies={replies} onPosted={() => void reload()} />
         </div>
@@ -105,7 +115,7 @@ function Coin() {
         <div className="space-y-4">
           <SupplyMeter listing={listing} />
           <Holders listing={listing} holders={holders} you={trader?.address ?? null} />
-          <RecentTrades book={book} listing={listing} />
+          <RecentTrades book={book} listing={listing} loading={loading} you={trader?.address ?? null} />
           <Provenance listing={listing} />
         </div>
       </div>
@@ -123,28 +133,50 @@ function Stat({ label, value, accent = false }: { label: string; value: string; 
 }
 
 /** Newest first here, unlike the chart, because a log is read from the top. */
-function RecentTrades({ book, listing }: { book: Book | null; listing: Listing }) {
+function RecentTrades({
+  book,
+  listing,
+  loading,
+  you,
+}: {
+  book: Book | null
+  listing: Listing
+  loading: boolean
+  you: string | null
+}) {
   const trades = [...(book?.trades ?? [])].reverse().slice(0, 12)
 
   return (
     <section className="panel p-3">
       <h3 className="eyebrow">Trades</h3>
-      {trades.length === 0 ? (
+      {loading && !book ? (
+        <p className="py-4 text-center text-xs text-fainter" role="status">
+          Reading the chain…
+        </p>
+      ) : trades.length === 0 ? (
         <p className="py-4 text-center text-xs text-fainter">Nothing has settled yet.</p>
       ) : (
-        <ul className="mt-2 space-y-1 font-mono text-[11px] tabular">
+        <ul className="mt-2 space-y-1.5 font-mono text-[11px] tabular">
           {trades.map((trade) => {
             // `trades({ asset })` matches either leg, so the coin is whichever
             // side of this one it is on. Reading `give` blind would print the
             // Kei amount as a coin count on any trade written the other way up.
             const coins = trade.give.asset === listing.asset ? trade.give.amount : trade.want.amount
+            const mine = trade.seller === you || trade.buyer === you
             return (
-              <li key={trade.hash} className="flex items-baseline justify-between gap-2">
-                <span className="text-dim">
-                  {formatCoins(coins)} {listing.symbol}
+              <li key={trade.hash}>
+                <span className="flex items-baseline justify-between gap-2">
+                  <span className={mine ? 'text-gold' : 'text-dim'}>
+                    {formatCoins(coins)} {listing.symbol}
+                  </span>
+                  <span className="text-ink">{formatPrice(trade.price)} Kei</span>
+                  <span className="text-fainter">{formatAge(trade.settledAt ?? trade.seenAt)}</span>
                 </span>
-                <span className="text-ink">{formatPrice(trade.price)} Kei</span>
-                <span className="text-fainter">{formatAge(trade.settledAt ?? trade.seenAt)}</span>
+                <span className="mt-0.5 block text-[10px] text-fainter">
+                  <span title={trade.seller}>{shortAddress(trade.seller, 4)}</span>
+                  <span aria-label=" sold to "> → </span>
+                  <span title={trade.buyer}>{shortAddress(trade.buyer, 4)}</span>
+                </span>
               </li>
             )
           })}

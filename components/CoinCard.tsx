@@ -16,6 +16,14 @@ import type { Listing } from '../shared/listing'
 import { CoinArt } from './CoinArt'
 import { PolicyBadge } from './PolicyBadge'
 
+/** Two figures near the top, none in the middle — the same rule the meter uses. */
+function creatorShare(listing: Listing): string {
+  const holds = listing.stats?.creatorHolds ?? listing.supply
+  const percent = listing.supply > 0 ? Math.min(100, Math.max(0, (holds / listing.supply) * 100)) : 0
+  if (percent > 0 && percent < 1) return `${percent.toFixed(1)}%`
+  return `${percent.toFixed(percent > 99 && percent < 100 ? 1 : 0)}%`
+}
+
 export function CoinCard({ listing, held = 0 }: { listing: Listing; held?: number }) {
   const stats = listing.stats
 
@@ -51,6 +59,9 @@ export function CoinCard({ listing, held = 0 }: { listing: Listing; held?: numbe
           </span>
           <span>{stats?.trades ?? 0} trades</span>
           <span>{stats?.holders ?? 0} holders</span>
+          {/* The number that says what is likely to happen next, on the card
+              rather than one click in. It starts at 100% for everybody. */}
+          {listing.transfer === 'open' && <span title="Share of the supply the launcher is still holding">{creatorShare(listing)} left with the creator</span>}
           {(stats?.replies ?? 0) > 0 && <span>{stats?.replies} replies</span>}
           {held > 0 && <span className="ml-auto text-gold">you hold {formatCoins(held)}</span>}
         </div>
