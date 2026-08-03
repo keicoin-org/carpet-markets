@@ -44,8 +44,10 @@ import {
   LAUNCH_SUPPLY,
   ListingError,
   type Book,
+  type Holder,
   type LaunchQuote,
   type Listing,
+  type ListingStats,
   type MarketFacts,
   type TransferPolicy,
 } from '../shared/listing.js'
@@ -56,6 +58,15 @@ export interface RegistryOptions {
   network?: NetworkName
   /** How long a quote waits for its payment before it is forgotten. */
   intentTtlMs?: number
+  /**
+   * How many replies a coin has, if anybody is counting.
+   *
+   * Injected rather than imported because replies are not the registry's
+   * business — they are not on the chain and this file's whole claim is that
+   * everything it reports came off one. It passes the number through for a card
+   * to render and never reads the text.
+   */
+  replyCount?(asset: string): number
 }
 
 export interface Registry {
@@ -66,6 +77,8 @@ export interface Registry {
   listing(asset: string): Listing | undefined
   /** The order book and the trade history, both read off the chain. */
   book(asset: string): Promise<Book>
+  /** Who holds it, of the accounts this registry knows to ask about. */
+  holders(asset: string): Promise<Holder[]>
   /**
    * Tell the registry an address is worth reading.
    *
@@ -83,6 +96,9 @@ export interface Registry {
 export class RegistryError extends Error {}
 
 const DEFAULT_INTENT_TTL_MS = 120_000
+
+/** How long a coin's card numbers are reused before they are read again. */
+const SUMMARY_TTL_MS = 4_000
 
 /**
  * What a launch costs, and why it is a constant.
@@ -150,6 +166,7 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
 
   const coins = new Map<string, Coin>()
   const intents = new Map<string, Intent>()
+  const summaries = new Map<string, { at: number; stats: ListingStats }>()
   /**
    * Every account whose chain might carry an offer.
    *
@@ -280,6 +297,75 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
     }
   }
 
+  /**
+   * Who holds it, read one `balanceOf` at a time.
+   *
+   * This has the same blind spot as the book and it is worth stating plainly: a
+   * holder the registry has never heard of does not appear. `traders` is every
+   * account that launched something, announced itself through `watch`, or was
+   * quoted a launch — which in practice is everybody who has used this page, and
+   * in principle is not everybody on the chain.
+   *
+   * So the rows are a floor, not a census, and the percentages are computed
+   * against the coin's supply rather than against the sum of the rows. A table
+   * that adds up to 60% is telling the truth about what it can see. One
+   * normalised to 100% would be inventing a denominator.
+   */
+  async function holders(asset: string): Promise<Holder[]> {
+    const coin = coins.get(asset)
+    if (!coin) throw new ListingError('That coin is not listed here.')
+
+    const token = await kei.token(asset)
+    const candidates = new Set<string>([...traders, coin.creator, coin.issuer])
+    candidates.delete(kei.address)
+
+    const rows = await Promise.all(
+      [...candidates].map(async (address) => ({
+        address,
+        amount: await token.balanceOf(address).catch(() => 0),
+        creator: address === coin.creator,
+        issuer: address === coin.issuer,
+      })),
+    )
+
+    return rows.filter((row) => row.amount > 0).sort((a, b) => b.amount - a.amount)
+  }
+
+  /**
+   * The card numbers, computed at most once every `SUMMARY_TTL_MS` per coin.
+   *
+   * Without the cache this is the most expensive thing the registry does: a
+   * price read and a `balanceOf` per known account, per coin, per client, every
+   * two seconds. With it, one tab and fifty tabs cost the same, which is the
+   * property that matters when the board is the first thing everybody loads.
+   *
+   * A stale entry is served rather than awaited on refresh failure, because a
+   * card showing numbers from four seconds ago is better than a card that
+   * flickers back to "never traded" when one read times out.
+   */
+  async function summarise(coin: Coin): Promise<ListingStats> {
+    const cached = summaries.get(coin.asset)
+    if (cached && Date.now() - cached.at < SUMMARY_TTL_MS) return cached.stats
+
+    try {
+      const [price, holding] = await Promise.all([
+        kei.market.price(coin.asset, { from: [...traders] }).catch(() => null),
+        holders(coin.asset).catch(() => []),
+      ])
+      const stats: ListingStats = {
+        last: price?.last ?? null,
+        trades: price?.trades ?? 0,
+        holders: holding.length,
+        replies: options.replyCount?.(coin.asset) ?? 0,
+        creatorHolds: holding.find((row) => row.creator)?.amount ?? 0,
+      }
+      summaries.set(coin.asset, { at: Date.now(), stats })
+      return stats
+    } catch {
+      return cached?.stats ?? { last: null, trades: 0, holders: 0, replies: 0, creatorHolds: coin.supply }
+    }
+  }
+
   // -------------------------------------------------------------------- plumbing
 
   async function pay(to: string, raw: bigint): Promise<void> {
@@ -310,11 +396,14 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
     address: kei.address,
 
     async facts() {
+      const listings = await Promise.all(
+        [...coins.values()].map(async (coin) => ({ ...describe(coin), stats: await summarise(coin) })),
+      )
       return {
         address: kei.address,
         network: kei.network,
         launchFee: formatKei(LAUNCH_FEE_RAW, 18),
-        listings: [...coins.values()].map(describe),
+        listings,
       }
     },
 
@@ -349,6 +438,8 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
     },
 
     book,
+
+    holders,
 
     watch(address) {
       if (typeof address === 'string' && address.startsWith('kei_')) traders.add(address)

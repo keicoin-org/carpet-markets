@@ -55,4 +55,34 @@ export function formatPrice(kei: number): string {
   return kei.toPrecision(3).replace(/\.?0+$/, '')
 }
 
+/**
+ * How long ago, in the shortest form that is still true.
+ *
+ * Coarse on purpose: a launchpad where a coin is "1m ago" and then "1m ago" and
+ * then "2m ago" is a page that redraws every list item every second to tell
+ * somebody nothing. Seconds are only shown for the first minute, when they are
+ * the whole story.
+ */
+export function formatAge(at: number, now = Date.now()): string {
+  const seconds = Math.max(0, Math.round((now - at) / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h`
+  return `${Math.floor(hours / 24)}d`
+}
+
+/**
+ * An address, shortened, keeping both ends.
+ *
+ * Both ends because the prefix is the same on every Kei address and the tail is
+ * what tells two of them apart — truncating only the end shows a column of
+ * identical strings.
+ */
+export function shortAddress(address: string, keep = 6): string {
+  if (address.length <= keep * 2 + 5) return address
+  return `${address.slice(0, 4 + keep)}…${address.slice(-keep)}`
+}
+
 export class FormatError extends Error {}

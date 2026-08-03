@@ -1,7 +1,8 @@
 name: check
 
-# The curve decides what people pay and the economy tests are where the badge on
-# every listing is either true or marketing, so both run on every push.
+# The ledger tests are where the badge on every listing is either true or
+# marketing, and the reply tests are where "signed" either means something or
+# does not. Both run on every push.
 on:
   push:
     branches: ['**']
@@ -28,5 +29,5 @@ jobs:
       - name: test
         run: bun test
 
-      - name: the client still bundles for a browser
+      - name: the client still exports to static files
         run: bun run build:site

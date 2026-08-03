@@ -53,6 +53,8 @@ export interface Listing {
   supply: number
   /** Milliseconds since the epoch. For sorting, and for the age column. */
   launchedAt: number
+  /** Absent until the registry has managed to read them once. */
+  stats?: ListingStats
 }
 
 /**
@@ -73,6 +75,59 @@ export interface Book {
   trades: Trade[]
   /** Null until the coin has traded once. */
   price: PriceSummary | null
+}
+
+/**
+ * The handful of numbers a coin card shows, so the board is worth looking at.
+ *
+ * These ride along with the listing because the alternative is what the first
+ * version of this page did: fetch a full book per coin to fill in one line of
+ * card text, or show nothing. It showed nothing, and a launchpad where every
+ * tile reads "1,000,000 supply" and stops is not a board, it is a list.
+ *
+ * The registry caches these — see `SUMMARY_TTL_MS` — because they cost a chain
+ * read per coin and every open tab asks for them on the same two-second beat.
+ */
+export interface ListingStats {
+  /** Kei per unit, from the last settled trade. Null until it has traded once. */
+  last: number | null
+  /** Settled trades, ever. */
+  trades: number
+  /** Accounts holding a non-zero balance, of those the registry can see. */
+  holders: number
+  replies: number
+  /**
+   * Whole units the launcher is still sitting on.
+   *
+   * The single most predictive number on the board and the reason it is computed
+   * for every card rather than on demand. A creator was minted the entire supply
+   * at launch, so this starts at 100% and only falls when they sell — which
+   * means a coin whose chart is climbing while this stays at 100% has a rally
+   * nobody has taken profit into yet, and one where it is falling fast is a
+   * distribution in progress with the price still up.
+   *
+   * On an `issuer-only` or soulbound coin it never moves, because nothing can.
+   */
+  creatorHolds: number
+}
+
+/**
+ * One account's stake in a coin, read off the chain with `balanceOf`.
+ *
+ * The list is only as complete as the registry's set of accounts to read, which
+ * is the same limit the order book has and for the same reason (SPEC §9.4). A
+ * holder who has never announced themselves is missing from this and present on
+ * the chain — so the percentages below are of the supply, never of the rows,
+ * and a total under 100% is the honest answer rather than a rounding bug.
+ */
+export interface Holder {
+  address: string
+  /** Whole units. Coins have no decimals. */
+  amount: number
+  /** True for the account that was minted the entire supply at launch. */
+  creator: boolean
+  /** True for the coin's own issuing account, which holds nothing after mint. */
+  issuer: boolean
 }
 
 export interface MarketFacts {
