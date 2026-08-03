@@ -20,7 +20,7 @@ import { DurableObject } from 'cloudflare:workers'
 import { MockNode, mockRpcHandler, randomSeed } from 'kei-transaction'
 
 import { ListingError } from '../shared/listing.js'
-import { MarketError, startMarket, type Market } from '../server/market.js'
+import { RegistryError, startRegistry, type Registry } from '../server/registry.js'
 
 interface Env {
   ASSETS: Fetcher
@@ -38,18 +38,18 @@ function apiPath(url: URL): string | null {
 }
 
 export class Floor extends DurableObject<Env> {
-  #booting: Promise<{ market: Market; rpc: (request: Request) => Promise<Response> }> | undefined
+  #booting: Promise<{ registry: Registry; rpc: (request: Request) => Promise<Response> }> | undefined
 
-  /** One chain and one market, built on the first request and kept. */
-  #ready(): Promise<{ market: Market; rpc: (request: Request) => Promise<Response> }> {
+  /** One chain and one registry, built on the first request and kept. */
+  #ready(): Promise<{ registry: Registry; rpc: (request: Request) => Promise<Response> }> {
     this.#booting ??= (async () => {
       const node = await MockNode.create({ faucetAmount: 25 })
-      const market = await startMarket({
+      const registry = await startRegistry({
         seed: this.env.CARPET_SEED ?? randomSeed(),
         node,
         network: 'mock',
       })
-      return { market, rpc: mockRpcHandler({ node }) }
+      return { registry, rpc: mockRpcHandler({ node }) }
     })()
     return this.#booting
   }
@@ -59,26 +59,27 @@ export class Floor extends DurableObject<Env> {
     const path = apiPath(url)
     if (!path) return new Response('Not found', { status: 404 })
 
-    const { market, rpc } = await this.#ready()
+    const { registry, rpc } = await this.#ready()
 
     if (path === '/rpc') return rpc(request)
 
     try {
       switch (path) {
         case '/market/facts':
-          return json(await market.facts())
+          return json(await registry.facts())
 
-        case '/market/claims':
-          return json({ bundles: market.claimsFor(url.searchParams.get('address') ?? '') })
+        case '/market/book':
+          return json(await registry.book(url.searchParams.get('asset') ?? ''))
 
         case '/market/launch': {
           const body = await read<{ address: string } & Record<string, unknown>>(request)
-          return json(await market.quoteLaunch(body.address, body))
+          return json(await registry.quoteLaunch(body.address, body))
         }
 
-        case '/market/buy': {
-          const { address, asset, budget } = await read<{ address: string; asset: string; budget: string }>(request)
-          return json(await market.quoteBuy(address, asset, budget))
+        case '/market/watch': {
+          const { address } = await read<{ address: string }>(request)
+          registry.watch(address)
+          return json({ watching: true })
         }
 
         default:
@@ -86,7 +87,7 @@ export class Floor extends DurableObject<Env> {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      return json({ error: message }, error instanceof ListingError || error instanceof MarketError ? 400 : 500)
+      return json({ error: message }, error instanceof ListingError || error instanceof RegistryError ? 400 : 500)
     }
   }
 }

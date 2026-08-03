@@ -16,7 +16,7 @@
 import { MockNode, mockRpcHandler, randomSeed } from 'kei-transaction'
 
 import { ListingError } from '../shared/listing.js'
-import { MarketError, startMarket } from './market.js'
+import { RegistryError, startRegistry } from './registry.js'
 
 /** Native, and with a trailing separator — `pathname` would hand Windows `/C:/…`. */
 const root = Bun.fileURLToPath(new URL('..', import.meta.url))
@@ -40,7 +40,7 @@ if (!bundle.success) {
 const node = await MockNode.create({ faucetAmount: 25 })
 const rpc = mockRpcHandler({ node })
 
-const market = await startMarket({
+const registry = await startRegistry({
   seed: process.env.CARPET_SEED ?? randomSeed(),
   node,
   network: 'mock',
@@ -52,7 +52,7 @@ const json = (body: unknown, status = 200): Response =>
 const failed = (error: unknown): Response =>
   json(
     { error: error instanceof Error ? error.message : String(error) },
-    error instanceof ListingError || error instanceof MarketError ? 400 : 500,
+    error instanceof ListingError || error instanceof RegistryError ? 400 : 500,
   )
 
 async function read<T>(request: Request): Promise<T> {
@@ -84,19 +84,23 @@ const server = Bun.serve({
     '/market/facts': {
       async GET() {
         try {
-          return json(await market.facts())
+          return json(await registry.facts())
         } catch (error) {
           return failed(error)
         }
       },
     },
 
-    // A commit publishes a root; the holder still has to write their own claim.
-    // This is where the proof they need to do that is picked up.
-    '/market/claims': {
-      GET(request) {
-        const address = new URL(request.url).searchParams.get('address') ?? ''
-        return json({ bundles: market.claimsFor(address) })
+    // The order book and the trade history, both read off the chains of the
+    // accounts the registry knows about. Nothing here is the server's opinion.
+    '/market/book': {
+      async GET(request) {
+        try {
+          const asset = new URL(request.url).searchParams.get('asset') ?? ''
+          return json(await registry.book(asset))
+        } catch (error) {
+          return failed(error)
+        }
       },
     },
 
@@ -104,18 +108,21 @@ const server = Bun.serve({
       async POST(request) {
         try {
           const body = await read<{ address: string } & Record<string, unknown>>(request)
-          return json(await market.quoteLaunch(body.address, body))
+          return json(await registry.quoteLaunch(body.address, body))
         } catch (error) {
           return failed(error)
         }
       },
     },
 
-    '/market/buy': {
+    // "I am somebody whose chain may carry an offer." The registry cannot see a
+    // settlement it was not part of, so a buyer says so itself.
+    '/market/watch': {
       async POST(request) {
         try {
-          const { address, asset, budget } = await read<{ address: string; asset: string; budget: string }>(request)
-          return json(await market.quoteBuy(address, asset, budget))
+          const { address } = await read<{ address: string }>(request)
+          registry.watch(address)
+          return json({ watching: true })
         } catch (error) {
           return failed(error)
         }
@@ -129,16 +136,20 @@ console.log(`
 
   trade         ${server.url}
   node (mock)   ${server.url}rpc
-  market        ${market.address}
+  registry      ${registry.address}
+
+  The registry issues coins and remembers who to read. It does not price
+  anything and never holds a coin: every trade here is an offer one player wrote
+  and another accepted, settled in one block by consensus.
 
   This chain is in memory and dies with this process. Every coin you can launch
   here is worthless by construction, which is what makes it safe to show you how
-  the rug works.
+  the dump works.
 `)
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {
-    market.close()
+    registry.close()
     void server.stop(true).then(() => process.exit(0))
   })
 }

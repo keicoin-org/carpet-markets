@@ -1,88 +1,104 @@
 /**
- * What the market says about a coin, and the rules for saying it.
+ * What the registry says about a coin, and the rules for saying it.
  *
- * This is the wire shape between the two halves. Numbers cross it as decimal
- * **strings**, never as JSON numbers: a raw Kei amount is a `bigint` on both
- * sides, and `JSON.stringify` would quietly round it into a lie somewhere around
- * the ninth significant figure.
+ * This is the wire shape between the two halves, and it is deliberately thin.
+ * The registry knows which coins exist and who to read; it does not know what
+ * anything is worth. Prices, order books, and trade history are read from the
+ * chain by `@keicoin/market`, on whichever side is asking.
+ *
+ * Amounts here are plain decimal numbers, matching the SDK's own posture
+ * (SPEC §6.1) and the `@keicoin/market` API these values are handed to. That
+ * costs precision at the far end of a double, which is fine for a price and
+ * would not be for a balance — so no balance crosses this file. Balances come
+ * from `balanceOf`, on the chain, in one call.
  */
+
+import type { Offer, PriceSummary, Trade } from 'kei-transaction'
 
 /**
- * Whether the deed to a coin can leave the hand that holds it.
+ * Who may move a coin's units, chosen at issuance and immutable after
+ * (SPEC §5.4). This is the whole argument of this example.
  *
- * This is the only thing in the game that matters, so it is the only setting the
- * launch form has. See `server/market.ts` for what the deed actually is.
+ * It is not a label the registry applies and could edit. It is a protocol flag
+ * the node validates every transfer against, which is why the three options
+ * below are three different *markets* rather than three different promises:
+ *
+ *   open        Units move between any two accounts, so a peer-to-peer order
+ *               book exists and cannot be switched off. Including by the
+ *               creator, who holds the supply at launch and can sell it into
+ *               that book at whatever pace they like. There is no version of
+ *               this where the market is real and that risk is not.
+ *   issuer-only Units move only to or from the issuer. No order book can exist,
+ *               because a `swap_offer` between two holders is an invalid block.
+ *               The issuer is the only counterparty there will ever be.
+ *   none        Soulbound. Nothing moves, so nothing trades, ever.
  */
-export type ReserveLock =
-  /** The deed is transferable. Whoever holds it can send it back and take the reserve. */
-  | 'carpet'
-  /** The deed is soulbound. It cannot be sent anywhere, so the reserve cannot be taken. */
-  | 'nailed-down'
-
-export type CoinState = 'trading' | 'graduated' | 'rugged'
+export type TransferPolicy = 'open' | 'issuer-only' | 'none'
 
 export interface Listing {
-  /** The chain's id for the coin. Derived from the issuer and the symbol. */
+  /** The chain's id for the coin, derived from its issuer and its symbol. */
   asset: string
   symbol: string
   name: string
   blurb: string
-  /** Who launched it. An address, and the only thing the market knows about them. */
+  /**
+   * The account that issued this coin, and the only one that could ever mint
+   * more. One per coin — see `server/registry.ts` for why.
+   */
+  issuer: string
+  /** Who paid for the launch and received the whole supply. */
   creator: string
-  lock: ReserveLock
-  /** The deed's asset id — the thing a creator sends back to rug. */
-  deed: string
-  state: CoinState
-  /** Coins sold off the curve. Raw, and raw here means whole coins. */
-  sold: string
-  /** Raw Kei backing them. Recomputed from `sold`, never accumulated. */
-  reserve: string
-  /** Raw Kei the next single coin costs. */
-  price: string
-  /** Milliseconds since the epoch, for sorting and for the chart. */
+  transfer: TransferPolicy
+  /** Whole units minted at launch. Coins have no decimals. */
+  supply: number
+  /** Milliseconds since the epoch. For sorting, and for the age column. */
   launchedAt: number
-  /** Every trade, oldest first. Trimmed; the chain has the real history. */
-  history: Tick[]
 }
 
-export interface Tick {
-  at: number
-  /** Supply after the trade. The chart plots price, which is derived from it. */
-  sold: string
-  kind: 'launch' | 'buy' | 'sell' | 'graduate' | 'rug'
+/**
+ * A coin's order book and what it has actually traded for.
+ *
+ * Both halves are read from the chains of the accounts the registry knows about
+ * (`ListOptions.from` is required, and SPEC §9.4 explains why: an offer lives on
+ * its author's chain, so "every offer on the network" is an indexer and Kei does
+ * not ship one). The registry's real job is being the list of accounts to read.
+ */
+export interface Book {
+  asset: string
+  /** Open offers giving this coin, cheapest first. */
+  asks: Offer[]
+  /** Open offers wanting this coin, best price first. */
+  bids: Offer[]
+  /** Settled offers, newest last. This is the price history — it is the trades. */
+  trades: Trade[]
+  /** Null until the coin has traded once. */
+  price: PriceSummary | null
 }
 
 export interface MarketFacts {
-  /** The market's own address. Every payment and every deed goes here. */
+  /** The registry's own address. Launch fees go here; nothing else does. */
   address: string
   network: string
-  /** Raw Kei the next launch costs, because the burn escalates (SPEC §5.6.5). */
+  /**
+   * Raw Kei a launch costs, as a decimal string.
+   *
+   * Flat, and it stays flat however many coins the registry has listed. The
+   * escalating issuance burn (SPEC §5.6.5) is charged per issuing account, and
+   * every coin here gets its own — so a launch always pays that account's first
+   * and second burn, and never anybody else's.
+   */
   launchFee: string
-  /** How many assets the market has issued. The reason the fee is what it is. */
-  issued: number
-  /** Raw Kei reserve at which a coin graduates. */
-  graduation: string
   listings: Listing[]
 }
 
-/** A launch the market has quoted but not yet been paid for. */
+/** A launch the registry has quoted and not yet been paid for. */
 export interface LaunchQuote {
-  /** Echoed back so the client can show what it is about to pay for. */
   symbol: string
   name: string
   /** Where to send the fee. */
   to: string
-  /** Raw Kei. Pay at least this. */
+  /** Decimal Kei. Pay at least this; change comes back. */
   fee: string
-}
-
-export interface BuyQuote {
-  asset: string
-  to: string
-  /** Raw Kei to send. Sending more buys more; sending less buys less. */
-  cost: string
-  /** Coins that much Kei buys right now. Advisory — the curve may move first. */
-  coins: string
 }
 
 // ------------------------------------------------------------------ validation
@@ -90,14 +106,24 @@ export interface BuyQuote {
 /** Symbols are what the chain derives an asset id from, so they are strict. */
 const SYMBOL = /^[A-Z][A-Z0-9]{1,9}$/
 
+/**
+ * Units minted at launch, all of them to the creator.
+ *
+ * One number rather than a form field, because a launchpad where the creator
+ * chooses their own allocation is a launchpad where the interesting number is
+ * hidden in a field nobody reads. Here everyone starts holding everything, and
+ * what happens next is visible in the book.
+ */
+export const LAUNCH_SUPPLY = 1_000_000
+
 export class ListingError extends Error {}
 
 /**
  * A coin's name and symbol, cleaned, or an error a person can act on.
  *
  * Run on the server, because the client is not the one that has to live with the
- * result, and run before anybody is charged, because the fee is not refundable —
- * the burn it pays for is not refundable either.
+ * result, and run before anybody is charged, because the fee pays for a burn and
+ * a burn is not refundable.
  */
 export function cleanIdentity(input: { symbol?: unknown; name?: unknown; blurb?: unknown }): {
   symbol: string
@@ -126,7 +152,9 @@ export function cleanIdentity(input: { symbol?: unknown; name?: unknown; blurb?:
   return { symbol, name, blurb }
 }
 
-export function cleanLock(input: unknown): ReserveLock {
-  if (input === 'carpet' || input === 'nailed-down') return input
-  throw new ListingError(`A coin's reserve is either "carpet" or "nailed-down"; "${String(input)}" is neither.`)
+export function cleanTransfer(input: unknown): TransferPolicy {
+  if (input === 'open' || input === 'issuer-only' || input === 'none') return input
+  throw new ListingError(
+    `A coin's transfer policy is "open", "issuer-only", or "none"; "${String(input)}" is none of them.`,
+  )
 }
