@@ -12,9 +12,9 @@ overhead, folds only state with proven set/bounded-tail semantics, and gives the
 log a hard admission bound once compaction is explicitly enabled. It cannot
 collapse the signed block history into a constant-size ledger state. When that
 canonical bound is reached, reads continue and a mutation is refused before its
-pending WAL row is written. An exact retry of an already accepted signed
-`process` body is the exception: the ledger returns the prior hash without
-allocating another sequence or WAL row.
+pending WAL row is written. A retry of an already accepted signed `process`
+block is the exception: the ledger returns the prior hash without allocating
+another sequence or WAL row.
 
 ## Measured envelope and limits
 
@@ -46,12 +46,12 @@ The policy is deliberately below the platform's storage ceiling:
 - cold replay target: at most 60 seconds in the pinned runtime workload.
 
 In `compact` mode both replay dimensions apply to the canonical accepted
-authority, after safe exact-process/watch/reply folding. Raw legacy duplicates
+authority, after safe process/watch/reply folding. Raw legacy duplicates
 and a removable pending WAL row therefore cannot brick boot. The raw tail is
 bounded independently by fail-closed compaction: the event that reaches the
 8-event checkpoint threshold remains accepted in v1 authority, but if generation
 verification, pointer activation, or cleanup fails, later new mutations get HTTP
-507 without allocating a sequence or row. An exact accepted `process` retry
+507 without allocating a sequence or row. A retry of an accepted `process` block
 remains available because it needs no new authority. There is no silent
 truncation. An over-limit compact-mode mutation likewise gets HTTP 507 and says
 that the ledger did not accept it; an oversized request gets HTTP 413 before a
@@ -78,9 +78,12 @@ Checkpoint-aware versions additionally use:
 
 The compaction sequence is:
 
-1. Canonicalise byte-identical accepted signed `process` retries, duplicate
-   `watch` inputs, and replies older than the existing 100-per-asset thread
-   tail. Never rewrite distinct RPC, seed, or launch order.
+1. Canonicalise accepted signed `process` retries, duplicate `watch` inputs, and
+   replies older than the existing 100-per-asset thread tail. A `process` retry
+   is identified by the ledger's own block hash — the body with `work` and
+   `signature` removed, which is what `MockLedger.process` recognises as a block
+   it already holds — so a re-encoded copy cannot buy a second row. Distinct
+   blocks hash differently; never rewrite distinct RPC, seed, or launch order.
 2. Write immutable chunks and their manifest as an inactive generation.
 3. Read every chunk back and verify count, bytes, registry identity, and digest.
 4. Atomically switch the one pointer, retaining the old active manifest as the

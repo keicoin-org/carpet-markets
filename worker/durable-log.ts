@@ -12,6 +12,8 @@
  * generation plus that tail.  Inactive chunks are never authoritative.
  */
 
+import { hashBlock, type BlockBody } from '@keicoin/core'
+
 export type EventInput =
   | { at: number; kind: 'seed'; registryAddress: string }
   | { at: number; kind: 'rpc'; body: string }
@@ -174,13 +176,34 @@ export function canonicalEvents(events: readonly StoredEvent[]): StoredEvent[] {
   })
 }
 
-/** Exact accepted process bodies are ledger-idempotent and need one authority row. */
+/**
+ * The identity of the ledger operation a `process` body asks for, if it is one.
+ *
+ * This is the ledger's own notion of the same block, not the request's bytes.
+ * `MockLedger.process` hashes the body with `work` and `signature` removed and
+ * returns a held block's hash before validating anything (@keicoin/core 0.3.0,
+ * mock/ledger.ts), so a re-encoded — or re-signed — copy of an accepted block
+ * is a no-op it recognises itself. Keying on the request text instead let one
+ * accepted block be respelled into as many canonical rows as there was replay
+ * budget, which no compaction can reclaim.
+ *
+ * Two genuinely distinct blocks hash differently and are never folded. Anything
+ * that is not a `process` of a hashable block body returns undefined: `faucet`
+ * pays out again on every call, and arbitrary bodies are left alone.
+ */
 export function processInputIdentity(body: string): string | undefined {
+  let input: { action?: unknown; block?: unknown }
   try {
-    const input = JSON.parse(body) as { action?: unknown; block?: unknown }
-    return input.action === 'process' && input.block !== null && typeof input.block === 'object'
-      ? body
-      : undefined
+    input = JSON.parse(body) as { action?: unknown; block?: unknown }
+  } catch {
+    return undefined
+  }
+  if (input?.action !== 'process') return undefined
+  if (!input.block || typeof input.block !== 'object' || Array.isArray(input.block)) return undefined
+
+  const { work: _work, signature: _signature, ...block } = input.block as Record<string, unknown>
+  try {
+    return hashBlock(block as unknown as BlockBody)
   } catch {
     return undefined
   }

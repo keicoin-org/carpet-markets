@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { keyPairFromSeed } from '@keicoin/core'
 
 import {
   CHECKPOINT_POINTERS,
@@ -84,7 +85,26 @@ async function storeLegacy(storage: MemoryStorage, events: StoredEvent[]): Promi
 }
 
 describe('durable replay checkpoints', () => {
-  test('canonicalisation folds exact process retries, set-like watches, and the bounded reply tail', () => {
+  test('canonicalisation folds re-encoded process retries, set-like watches, and the reply tail', async () => {
+    const { address } = await keyPairFromSeed('29'.repeat(32), 0)
+    const block = {
+      type: 'state',
+      subtype: 'open',
+      account: address,
+      previous: '0'.repeat(64),
+      representative: address,
+      balance: '1000000000000000000',
+      link: 'A'.repeat(64),
+      work: 'abc',
+      signature: 'F'.repeat(128),
+    }
+    // The same block the ledger already holds, spelled three ways a client or a
+    // proxy could legitimately produce, plus one genuinely different block.
+    const asPosted = JSON.stringify({ action: 'process', block })
+    const reEncoded = JSON.stringify({ action: 'process', block }, null, 2)
+    const reSigned = JSON.stringify({ action: 'process', block: { ...block, signature: '0'.repeat(128) } })
+    const distinct = JSON.stringify({ action: 'process', block: { ...block, link: 'B'.repeat(64) } })
+
     const events: StoredEvent[] = [seed(), watch(1), watch(2)]
     for (let sequence = 3; sequence < 108; sequence += 1) {
       events.push({
@@ -102,37 +122,25 @@ describe('durable replay checkpoints', () => {
         },
       })
     }
-    events.push({
-      version: 1,
-      sequence: 108,
-      status: 'accepted',
-      kind: 'rpc',
-      at: 108,
-      body: '{"action":"process","block":{"hash":"same"}}',
-    })
-    events.push({
-      version: 1,
-      sequence: 109,
-      status: 'accepted',
-      kind: 'rpc',
-      at: 109,
-      body: '{"action":"process","block":{"hash":"same"}}',
-    })
-    events.push({
-      version: 1,
-      sequence: 110,
-      status: 'accepted',
-      kind: 'rpc',
-      at: 110,
-      body: '{"action":"process","block":{"hash":"different"}}',
-    })
+    for (const [offset, body] of [asPosted, reEncoded, reSigned, distinct].entries()) {
+      events.push({
+        version: 1,
+        sequence: 108 + offset,
+        status: 'accepted',
+        kind: 'rpc',
+        at: 108 + offset,
+        body,
+      })
+    }
 
     const compacted = canonicalEvents(events)
     expect(compacted.filter((event) => event.kind === 'watch').map((event) => event.sequence)).toEqual([1])
     expect(compacted.filter((event) => event.kind === 'reply')).toHaveLength(100)
+    // The first spelling of the block that moved the ledger, and the other
+    // block. Re-encoding and re-signing buy nothing.
     expect(compacted.filter((event) => event.kind === 'rpc').map((event) => event.sequence)).toEqual([
       108,
-      110,
+      111,
     ])
   })
 

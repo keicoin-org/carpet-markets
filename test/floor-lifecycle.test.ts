@@ -102,13 +102,34 @@ async function answer<T>(response: Response): Promise<T> {
   return body
 }
 
-function nodeFor(floor: FloorLike): HttpNode {
+function nodeFor(floor: FloorLike, posted?: string[]): HttpNode {
   return new HttpNode({
     url: 'https://example.test/examples/carpet-markets/rpc',
     network: 'mock',
     pollInterval: 60_000,
-    fetch: ((input, init) => floor.fetch(new Request(input, init))) as typeof fetch,
+    fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input as Request, init)
+      if (posted) {
+        const text = await request.clone().text()
+        if (text.includes('"process"')) posted.push(text)
+      }
+      return floor.fetch(request)
+    }) as typeof fetch,
   })
+}
+
+function postBody(floor: FloorLike, body: string): Promise<Response> {
+  return floor.fetch(
+    new Request('https://example.test/examples/carpet-markets/rpc', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    }),
+  )
+}
+
+function eventRows(storage: FakeStorage): string[] {
+  return [...storage.values.keys()].filter((key) => key.startsWith('event:v1:'))
 }
 
 test(
@@ -359,6 +380,64 @@ test(
     expect([...storage.values.keys()].filter((key) => key.startsWith('event:v1:'))).toEqual(raw)
   },
   60_000,
+)
+
+test(
+  'a re-encoded copy of an accepted signed block is one operation and buys no authority',
+  async () => {
+    const storage = new FakeStorage()
+    const floor = openFloor(storage, { CARPET_NETWORK: 'mock', CARPET_LOG_MODE: 'compact' })
+    await answer<MarketFacts>(await call(floor, '/market/facts'))
+
+    const posted: string[] = []
+    const buyer = await Kei.server({ seed: BUYER_SEED, node: nodeFor(floor, posted), network: 'mock' })
+    try {
+      await buyer.faucet(50)
+      await buyer.sync()
+    } finally {
+      buyer.close()
+    }
+    const exact = posted.at(-1)!
+    const accepted = JSON.parse(exact) as { action: string; block: Record<string, unknown> }
+
+    const rowsBefore = eventRows(storage)
+    const sequenceBefore = storage.values.get('meta:event-sequence:v1')
+    const hash = await answer<{ hash: string }>(await postBody(floor, exact))
+
+    // `MockLedger.process` hashes the block body and returns a held block's hash
+    // before it validates anything, signature included (@keicoin/core 0.3.0,
+    // mock/ledger.ts). So none of these is a second ledger operation; only the
+    // request bytes differ. Re-encoding is ordinary client and proxy behaviour,
+    // and the tampered signature is the adversarial spelling of the same thing.
+    const copies = [
+      JSON.stringify(accepted, null, 2),
+      JSON.stringify({ block: accepted.block, action: accepted.action }),
+      JSON.stringify({ ...accepted, block: { ...accepted.block, signature: '0'.repeat(128) } }),
+      ...Array.from({ length: 16 }, (_, index) =>
+        JSON.stringify(accepted).replace('{"action"', `{${' '.repeat(index + 1)}"action"`),
+      ),
+    ]
+    expect(new Set(copies).size).toBe(copies.length)
+    for (const copy of copies) expect(copy).not.toBe(exact)
+
+    for (const copy of copies) {
+      const response = await postBody(floor, copy)
+      expect(response.status).toBe(200)
+      expect(await response.json()).toEqual(hash)
+    }
+
+    // Nineteen re-encodings is more than the sixteen-event replay bound. If any
+    // of them had bought a canonical slot the log would be full, the tail would
+    // have compacted, and the honest write below would be refused instead.
+    expect(eventRows(storage)).toEqual(rowsBefore)
+    expect(storage.values.get('meta:event-sequence:v1')).toBe(sequenceBefore)
+    expect(
+      await answer<{ watching: boolean }>(
+        await call(floor, '/market/watch', { address: 'kei_capacity_was_never_spent' }),
+      ),
+    ).toEqual({ watching: true })
+  },
+  120_000,
 )
 
 test('an unknown durable-log mode refuses traffic before writing mock authority', async () => {
