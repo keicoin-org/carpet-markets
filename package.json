@@ -18,10 +18,12 @@
     "build:site": "bun run build.ts",
     "preview": "bun run build.ts && wrangler dev",
     "deploy": "bun run build.ts && wrangler deploy",
-    "check": "bun run typecheck && bun run typecheck:worker && bun test",
+    "check": "bun run typecheck && bun run typecheck:worker && bun run typecheck:worker-test && bun test && bun run test:workers",
     "typecheck": "tsc --noEmit",
     "typecheck:worker": "tsc --noEmit -p tsconfig.worker.json",
-    "test": "bun test"
+    "typecheck:worker-test": "tsc --noEmit -p tsconfig.worker-test.json",
+    "test": "bun test",
+    "test:workers": "vitest run --config vitest.worker.config.ts && vitest run --config vitest.mainnet.config.ts"
   },
   "dependencies": {
     "@keicoin/core": "^0.3.0",
@@ -31,6 +33,7 @@
     "react-dom": "^19.2.8"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.20.1",
     "@cloudflare/workers-types": "^5.20260801.1",
     "@happy-dom/global-registrator": "^20.11.1",
     "@tailwindcss/postcss": "^4.3.3",
@@ -41,6 +44,7 @@
     "postcss": "^8.5.25",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.0",
+    "vitest": "^4.1.10",
     "wrangler": "^4.0.0"
   }
 }

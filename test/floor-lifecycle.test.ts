@@ -98,7 +98,7 @@ function nodeFor(floor: FloorLike): HttpNode {
 }
 
 test(
-  'the actual Floor replays its seeded ledger, first buy, holder, and signed reply after eviction',
+  'the fast Floor harness replays its seeded ledger, first buy, holder, and signed reply',
   async () => {
     const storage = new FakeStorage()
     const first = openFloor(storage)
@@ -156,7 +156,8 @@ test(
     expect(activityBefore.trades.length).toBeGreaterThan(0)
     buyer.close()
 
-    // A new class instance with the same storage is a DO eviction/cold start.
+    // A new class instance with the same fake storage exercises replay quickly;
+    // test/worker-runtime/floor.runtime.ts is the actual runtime eviction proof.
     const second = openFloor(storage)
     const after = await answer<MarketFacts>(await call(second, '/market/facts'))
     const afterListing = after.listings.find((entry) => entry.symbol === 'FRINGE')!
