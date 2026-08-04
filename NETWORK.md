@@ -144,15 +144,15 @@ through `wrangler dev --local`, which is the Durable Object for real:
 
 | Mode | `GET /examples/carpet-markets/market/facts` |
 |---|---|
-| default | `{"chain":{"mode":"mock","node":null,"ephemeral":true}}`, then `bun run seed` listed six coins |
+| default | `{"chain":{"mode":"mock","node":null,"ephemeral":false}}`; the Worker seeds six coins itself and replays successful mutations from Durable Object storage |
 | `CARPET_NETWORK=testnet` | `{"chain":{"mode":"testnet","node":"https://testnet.keicoin.org/rpc","ephemeral":false}}`, `/rpc` proxied `version` to the real node, and `bun run seed` launched and traded six coins on it |
 | `CARPET_NETWORK=mainnet` | HTTP 503 and the refusal, with all five gates named |
 
 Two things the audit turned up that are worth writing down.
 
-**The object is not always the chain.** On the mock it holds the whole ledger, so
-an eviction resets the market — an empty board means the object restarted rather
-than that nobody came. On the testnet it holds only the registry, and `/rpc` is a
+**The object is not always the chain.** On the mock it holds the whole ledger and
+a versioned input log; eviction rebuilds the same demo state, while deleting the
+object's storage is the explicit reset. On the testnet it holds only the registry, and `/rpc` is a
 deliberately dumb pass-through: it does not rewrite actions, cache them, or add a
 header the node did not ask for, because anything it did to a block on the way
 past would be a claim the chain had not made. All it adds is CORS.

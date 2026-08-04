@@ -17,8 +17,9 @@
 
   // Which chain the deployed copy runs on, stated rather than defaulted.
   //
-  // `mock` keeps the whole ledger inside the Durable Object: it resets when the
-  // object is evicted, and the badge in the bar says so. `testnet` points the
+  // `mock` keeps the whole ledger inside the Durable Object. A versioned event
+  // log rebuilds the same no-value demo after eviction; deleting the object's
+  // storage is the explicit reset. `testnet` points the
   // registry at https://testnet.keicoin.org/rpc and turns /rpc into a
   // pass-through, which NETWORK.md shows working end to end.
   //

@@ -25,6 +25,7 @@ import {
   resolveMode,
   type ProbeStep,
 } from '../shared/network.js'
+import { openChain } from '../server/network.js'
 
 const step = (id: string, ok: boolean): ProbeStep => ({ id, what: id, ok, detail: '', ms: 1 })
 const all = (ok: boolean): ProbeStep[] => REQUIRED_STEPS.map((id) => step(id, ok))
@@ -90,6 +91,14 @@ test('neither runnable mode is described as worth anything', () => {
   for (const network of Object.values(NETWORKS)) {
     expect(network.detail).not.toMatch(/production[- ]ready|ready for mainnet|launch date/i)
   }
+})
+
+test('the deployed mock says eviction is durable without pretending it is a network', async () => {
+  const chain = await openChain({ durable: true })
+  expect(chain.facts.ephemeral).toBe(false)
+  expect(NETWORKS.mock.summary).toMatch(/replays.*after eviction/i)
+  expect(NETWORKS.mock.detail).toMatch(/not a network/i)
+  expect(NETWORKS.mock.detail).toMatch(/does not give these coins value|worth nothing|no-value/i)
 })
 
 test('the mainnet gates name their own sections, so each claim is checkable', () => {

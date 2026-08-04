@@ -10,7 +10,8 @@
  *
  * Three modes exist and only two can be selected.
  *
- *   mock      An in-memory chain in the same process. Resets when it restarts.
+ *   mock      A single-process chain. Local dev resets; the deployed demo
+ *             replays its Durable Object event log after eviction.
  *   testnet   A real Kei network, over HTTP, with real blocks and real
  *             consensus — and coins that are still worth nothing, because a
  *             testnet is a testnet.
@@ -48,9 +49,9 @@ export const NETWORKS: Record<NetworkMode, NetworkDescription> = {
     mode: 'mock',
     label: 'Mock chain',
     summary:
-      'The chain under this page is an in-memory mock in the same process as the market, and it resets when that process restarts.',
+      'The chain under this page is a same-process mock. The deployed demo replays its no-value state after eviction; local development resets when stopped.',
     detail:
-      'Blocks are real blocks and the ledger enforces every rule this demo makes a claim about — the transfer policy, the swap lock, the issuance burn. What it is not is a network: one process holds the whole ledger, nobody else is validating anything, and there is no consensus to disagree with it. Stop the server and every coin on it is gone. That is the point rather than a limitation, because the only safe place to demonstrate somebody losing money is a chain where there is none.',
+      'Blocks are real blocks and the ledger enforces every rule this demo makes a claim about — the transfer policy, the swap lock, the issuance burn. It is not a network: one process holds the whole ledger, nobody else validates anything, and there is no consensus to disagree with it. The deployed Worker rebuilds that mock from a Durable Object event log after eviction; deleting that object resets it, and local development still resets when its process stops. Persistence does not give these coins value or make the mock mainnet-ready.',
     peerToPeer: true,
     selectable: true,
     tone: 'mock',
@@ -165,7 +166,7 @@ export interface NetworkFacts {
   sdkNetwork: string
   /** The node URL, when there is one to name. Null for an in-process mock. */
   node: string | null
-  /** Whether the ledger dies with the process serving this page. */
+  /** Whether this serving mode loses its ledger when its process is replaced. */
   ephemeral: boolean
 }
 
