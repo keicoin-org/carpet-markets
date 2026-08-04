@@ -5,6 +5,7 @@ declare global {
     interface Env {
       ASSETS: Fetcher
       CARPET_NETWORK: string
+      CARPET_LOG_MODE: string
       FLOOR: DurableObjectNamespace<Floor>
     }
   }

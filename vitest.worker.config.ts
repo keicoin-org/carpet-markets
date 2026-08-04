@@ -6,6 +6,9 @@ export default defineConfig({
     cloudflareTest({
       wrangler: { configPath: './wrangler.jsonc' },
       miniflare: {
+        // Production deliberately starts in the non-destructive compatibility
+        // phase. Runtime tests exercise the later, explicit compaction phase.
+        bindings: { CARPET_LOG_MODE: 'compact' },
         // The persistence proof only exercises the API/DO path. Replacing the
         // static asset binding keeps the test independent of a prior site build.
         serviceBindings: {
@@ -16,6 +19,8 @@ export default defineConfig({
   ],
   test: {
     include: ['test/worker-runtime/floor.runtime.ts'],
-    testTimeout: 120_000,
+    // The measured replay target is 60 s. This test performs three cold boots
+    // plus signed traffic; slower Windows CI needs headroom around the suite.
+    testTimeout: 240_000,
   },
 })

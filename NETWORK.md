@@ -1,5 +1,9 @@
 # Which chain is under this, and what was actually checked
 
+The deployed mock's storage bounds, checkpoint protocol, two-release rollout,
+and recovery runbook are in [`DURABLE_LOG.md`](./DURABLE_LOG.md). Its v2 object is
+a bounded **replay checkpoint**, not a `MockLedger` state snapshot.
+
 This demo used to run on a mock chain because the public network was not ready to
 carry a market. That was a claim, not a measurement, and a claim like that goes
 stale silently — so it is now checked by a script anybody can run, and the answer
