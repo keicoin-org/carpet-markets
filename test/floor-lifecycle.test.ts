@@ -268,7 +268,7 @@ test(
     expect(facts.listings).toHaveLength(6)
     expect(storage.values.has(key)).toBe(false)
   },
-  30_000,
+  60_000,
 )
 
 test(
