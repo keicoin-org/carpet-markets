@@ -25,6 +25,7 @@ import {
   seedStoreKey,
   type Offer,
   type Settlement,
+  type Trade,
 } from 'kei-transaction'
 
 import type { Book, Holder, LaunchQuote, MarketFacts, TransferPolicy } from '../shared/listing'
@@ -65,6 +66,15 @@ export interface Trader {
    */
   incoming(): Promise<{ kei: bigint; arrivals: number }>
   facts(): Promise<MarketFacts>
+  /**
+   * What has settled anywhere on the board lately, newest first.
+   *
+   * One read across every account the registry knows about rather than one per
+   * coin — history is per-account on a block-lattice, so this is a bounded walk
+   * rather than a ledger sweep (SPEC §9.1). It is exactly as complete as the
+   * account list, which is to say not completely, and the strip says so.
+   */
+  activity(limit?: number): Promise<Trade[]>
   /** The order book and trade history for one coin. */
   book(asset: string): Promise<Book>
   /** Who holds it, of the accounts the registry knows to ask about. */
@@ -81,6 +91,16 @@ export interface Trader {
    * unloads a position without printing what they are doing in one candle.
    */
   sell(asset: string, amount: number, unitPrice: number): Promise<Offer>
+  /**
+   * The mirror: lock Kei, and take the coins from whoever fills it.
+   *
+   * The same `swap_offer` block with the legs the other way up, which is why a
+   * two-sided book here needs no matching engine and no second primitive. It is
+   * also the only way to be a buyer when nobody is selling — there is no curve
+   * to hit, so wanting to buy has to be something a person can *write down*
+   * rather than something the page pretends is always available.
+   */
+  bid(asset: string, amount: number, unitPrice: number): Promise<Offer>
   /** Take somebody's offer. One block, both legs or neither (SPEC §9.2). */
   accept(offer: string): Promise<Settlement>
   /** Take back your own unaccepted offer, and the coins with it. */
@@ -143,6 +163,9 @@ export async function connect(): Promise<Trader> {
 
     facts: () => get<MarketFacts>('market/facts'),
 
+    activity: (limit = 24) =>
+      get<{ trades: Trade[] }>(`market/activity?limit=${limit}`).then((body) => body.trades),
+
     book: (asset) => get<Book>(`market/book?asset=${encodeURIComponent(asset)}`),
 
     holders: (asset) =>
@@ -185,6 +208,12 @@ export async function connect(): Promise<Trader> {
     async sell(asset, amount, unitPrice) {
       await kei.sync()
       return kei.market.sell({ asset, amount, price: amount * unitPrice })
+    },
+
+    // `price` is the total again, for the same reason and with the same trap.
+    async bid(asset, amount, unitPrice) {
+      await kei.sync()
+      return kei.market.bid({ asset, amount, price: amount * unitPrice })
     },
 
     accept: (offer) => kei.market.accept(offer),

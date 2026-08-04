@@ -17,9 +17,11 @@
  */
 
 import { DurableObject } from 'cloudflare:workers'
-import { MockNode, mockRpcHandler, randomSeed } from 'kei-transaction'
+import { randomSeed } from 'kei-transaction'
 
+import { openChain, type ChainSource } from '../server/network.js'
 import { ListingError } from '../shared/listing.js'
+import { NetworkRefused } from '../shared/network.js'
 import { ReplyError } from '../shared/social.js'
 import { RegistryError, startRegistry, type Registry } from '../server/registry.js'
 import { Threads, type PostReply } from '../server/social.js'
@@ -29,6 +31,17 @@ interface Env {
   FLOOR: DurableObjectNamespace<Floor>
   /** Optional. Without it the market is new on every boot, which is fine here. */
   CARPET_SEED?: string
+  /**
+   * `mock` (the default) or `testnet`. `mainnet` is refused, loudly, on boot.
+   *
+   * It is a variable rather than a constant because the same bundle is served
+   * from more than one place and the honest answer differs — and because the
+   * client reads it back out of `/market/facts` rather than out of its own
+   * build, so a deploy that changes this changes the badge with it.
+   */
+  CARPET_NETWORK?: string
+  /** The node URL when `CARPET_NETWORK=testnet`. Defaults to the public one. */
+  CARPET_NODE?: string
 }
 
 /** Everything under the mount point that is not a static file. */
@@ -40,7 +53,7 @@ function apiPath(url: URL): string | null {
 }
 
 export class Floor extends DurableObject<Env> {
-  #booting: Promise<{ registry: Registry; rpc: (request: Request) => Promise<Response> }> | undefined
+  #booting: Promise<{ registry: Registry; chain: ChainSource }> | undefined
 
   /**
    * The reply threads, in memory beside the chain and lost with it.
@@ -51,17 +64,29 @@ export class Floor extends DurableObject<Env> {
    */
   readonly #threads = new Threads()
 
-  /** One chain and one registry, built on the first request and kept. */
-  #ready(): Promise<{ registry: Registry; rpc: (request: Request) => Promise<Response> }> {
+  /**
+   * One chain and one registry, built on the first request and kept.
+   *
+   * On the mock the object *is* the chain, so an eviction resets the market — an
+   * empty board means the object restarted rather than that nobody came. On the
+   * testnet the object is not the chain at all: it holds the registry, and
+   * `/rpc` is a pass-through to a node somewhere else, so an eviction loses the
+   * list of coins and none of the blocks.
+   */
+  #ready(): Promise<{ registry: Registry; chain: ChainSource }> {
     this.#booting ??= (async () => {
-      const node = await MockNode.create({ faucetAmount: 25 })
+      const chain = await openChain({
+        network: this.env.CARPET_NETWORK,
+        node: this.env.CARPET_NODE,
+      })
       const registry = await startRegistry({
         seed: this.env.CARPET_SEED ?? randomSeed(),
-        node,
-        network: 'mock',
+        node: chain.node,
+        network: chain.sdkNetwork,
+        chain: chain.facts,
         replyCount: (asset) => this.#threads.count(asset),
       })
-      return { registry, rpc: mockRpcHandler({ node }) }
+      return { registry, chain }
     })()
     return this.#booting
   }
@@ -71,9 +96,20 @@ export class Floor extends DurableObject<Env> {
     const path = apiPath(url)
     if (!path) return new Response('Not found', { status: 404 })
 
-    const { registry, rpc } = await this.#ready()
+    let registry: Registry
+    let chain: ChainSource
+    try {
+      ;({ registry, chain } = await this.#ready())
+    } catch (error) {
+      // A refused network is a deployment mistake, and it has to read like one:
+      // an object that half-booted and served a mock instead would be the exact
+      // quiet degradation `shared/network.ts` exists to prevent.
+      this.#booting = undefined
+      const message = error instanceof Error ? error.message : String(error)
+      return json({ error: message }, error instanceof NetworkRefused ? 503 : 500)
+    }
 
-    if (path === '/rpc') return rpc(request)
+    if (path === '/rpc') return chain.rpc(request)
 
     try {
       switch (path) {
@@ -85,6 +121,11 @@ export class Floor extends DurableObject<Env> {
 
         case '/market/holders':
           return json({ holders: await registry.holders(url.searchParams.get('asset') ?? '') })
+
+        case '/market/activity': {
+          const asked = Number(url.searchParams.get('limit') ?? 24)
+          return json({ trades: await registry.activity(Number.isFinite(asked) ? asked : 24) })
+        }
 
         case '/market/replies':
           return json({ replies: this.#threads.list(url.searchParams.get('asset') ?? '') })

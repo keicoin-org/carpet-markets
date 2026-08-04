@@ -220,6 +220,87 @@ test('two coins cannot share a symbol', async () => {
   ).rejects.toThrow(/already listed/i)
 })
 
+test('a bid is the same block with its legs the other way up, and a holder can fill it', async () => {
+  // The other half of the market, and the reason the demo has one at all: a
+  // buyer with nobody selling can still write something real. `bid` locks Kei
+  // rather than coins, and filling it is the same `swap_accept` a buy is —
+  // signed by the holder instead of the buyer.
+  const listing = (await registry.facts()).listings.find((entry) => entry.symbol === 'THIRD')!
+
+  const keiBefore = await keiOf(bob)
+  const bid = await bob.market.bid({ asset: listing.asset, amount: 2_000, price: 2_000 * UNIT_PRICE })
+
+  // The Kei left Bob's spendable balance the moment the offer block was signed.
+  expect(await keiOf(bob)).toBeLessThan(keiBefore)
+  expect(bid.want.asset).toBe(listing.asset)
+
+  const book = await registry.book(listing.asset)
+  expect(book.bids.map((entry) => entry.hash)).toContain(bid.hash)
+  // A bid is not an ask, and a page that put it in the wrong column would offer
+  // people the chance to buy coins that are not for sale.
+  expect(book.asks.map((entry) => entry.hash)).not.toContain(bid.hash)
+
+  const aliceCoinsBefore = await coinsOf(alice, listing.asset)
+  await alice.market.accept(bid.hash)
+
+  expect(await coinsOf(alice, listing.asset)).toBe(aliceCoinsBefore - 2_000)
+  expect(await coinsOf(bob, listing.asset)).toBe(2_000)
+})
+
+// Longer than the default, because the card numbers are cached for a few
+// seconds each and this waits out two of those windows deliberately: it is
+// asserting that the cache eventually tells the truth, not that it is absent.
+test('a card knows whether anybody is selling, and at what', async () => {
+  // The board's "buyable now" chip and its cheapest-ask sort both read these,
+  // and both would be inventing availability if they came off the last trade.
+  // THIRD rather than CARPET, because CARPET still has a live ask from the
+  // peer-to-peer test above and this is checking the transition to and from
+  // nothing being for sale.
+  const listing = (await registry.facts()).listings.find((entry) => entry.symbol === 'THIRD')!
+  expect((await registry.book(listing.asset)).asks).toHaveLength(0)
+
+  const offer = await alice.market.sell({ asset: listing.asset, amount: 1_000, price: 1_000 * UNIT_PRICE })
+
+  const listed = await until('the card to notice the offer', async () => {
+    const entry = (await registry.facts()).listings.find((row) => row.symbol === 'THIRD')
+    return (entry?.stats?.asks ?? 0) > 0 ? entry : undefined
+  })
+
+  expect(listed.stats?.bestAsk).toBeCloseTo(UNIT_PRICE, 12)
+
+  await alice.market.cancel(offer.hash)
+  const quiet = await until('the card to notice the cancel', async () => {
+    const entry = (await registry.facts()).listings.find((row) => row.symbol === 'THIRD')
+    return entry && (entry.stats?.asks ?? 0) === 0 ? entry : undefined
+  })
+  expect(quiet.stats?.bestAsk).toBeNull()
+}, 30_000)
+
+test('the activity feed is settlements across every coin, read in one walk', async () => {
+  const trades = await registry.activity(50)
+  expect(trades.length).toBeGreaterThan(0)
+
+  // Every row is a settled swap between two accounts on a coin this registry
+  // lists — not a launch, not an offer, and not something it made up.
+  const assets = new Set((await registry.facts()).listings.map((entry) => entry.asset))
+  for (const trade of trades) {
+    expect(trade.state).toBe('accepted')
+    expect(assets.has(trade.give.asset) || assets.has(trade.want.asset)).toBe(true)
+    expect(trade.seller).not.toBe(trade.buyer)
+  }
+
+  // Newest first, so the strip reads from the top like a log.
+  const times = trades.map((trade) => trade.settledAt ?? trade.seenAt)
+  expect([...times].sort((a, b) => b - a)).toEqual(times)
+})
+
+test('the facts say which chain this is, rather than the client guessing', async () => {
+  const facts = await registry.facts()
+  expect(facts.chain.mode).toBe('mock')
+  expect(facts.chain.ephemeral).toBe(true)
+  expect(facts.chain.node).toBeNull()
+})
+
 test('bad identities are refused before anybody is charged', async () => {
   for (const bad of [
     { symbol: 'x', name: 'Lowercase and too short', transfer: 'open' },

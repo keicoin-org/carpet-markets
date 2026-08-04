@@ -15,6 +15,23 @@
     "not_found_handling": "404-page"
   },
 
+  // Which chain the deployed copy runs on, stated rather than defaulted.
+  //
+  // `mock` keeps the whole ledger inside the Durable Object: it resets when the
+  // object is evicted, and the badge in the bar says so. `testnet` points the
+  // registry at https://testnet.keicoin.org/rpc and turns /rpc into a
+  // pass-through, which NETWORK.md shows working end to end.
+  //
+  // Flipping it is one word here and an operational decision that is not this
+  // repository's to make: the public node is one best-effort box with no uptime
+  // promise (SPEC §15), and every open tab polls it every two seconds. So it
+  // ships as `mock` until somebody who owns that box says otherwise.
+  //
+  // `mainnet` is refused by the Worker on boot. It is not a value to try.
+  "vars": {
+    "CARPET_NETWORK": "mock"
+  },
+
   // The chain and the market. One object, one name, so everybody trades against
   // the same book.
   "durable_objects": {

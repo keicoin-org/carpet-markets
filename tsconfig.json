@@ -44,6 +44,7 @@
     "lib",
     "server",
     "shared",
+    "scripts",
     "test",
     "build.ts",
     "dev.ts",

@@ -31,3 +31,23 @@ jobs:
 
       - name: the client still exports to static files
         run: bun run build:site
+
+  # The claim that the public testnet can carry this market, checked against the
+  # live node rather than against a fixture. It is a separate job because it
+  # depends on a box the project runs best-effort, with no uptime promise
+  # (SPEC §15) — a node that is down is news about the node, not about this
+  # repository, so it must not fail the merge.
+  testnet:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.0
+
+      - run: bun install --frozen-lockfile
+
+      - name: the public testnet still carries the whole swap path
+        run: bun run probe:testnet
