@@ -36,7 +36,7 @@ type EventInput =
   | { at: number; kind: 'watch'; address: string }
   | { at: number; kind: 'reply'; body: PostReply }
 
-type StoredEvent = EventInput & { version: 1; sequence: number }
+type StoredEvent = EventInput & { version: 1; sequence: number; status: 'pending' | 'accepted' }
 
 const EVENT_PREFIX = 'event:v1:'
 const NEXT_SEQUENCE = 'meta:event-sequence:v1'
@@ -119,6 +119,7 @@ export class Floor extends DurableObject<Env> {
         const seeded = await this.#append({ kind: 'seed', registryAddress: registry.address, at: Date.now() })
         try {
           await this.#apply(seeded.event, state)
+          await this.#accept(seeded.event)
         } catch (error) {
           await this.ctx.storage.delete(seeded.key)
           registry.close()
@@ -127,12 +128,25 @@ export class Floor extends DurableObject<Env> {
       } else {
         try {
           for (const event of stored) {
-            const response = await this.#apply(event, state)
-            if (response instanceof Response) {
-              const failure = await responseFailure(response)
-              if (failure) {
-                throw new Error(`Persisted ${event.kind} event ${event.sequence} failed replay: ${failure}`)
+            try {
+              const response = await this.#apply(event, state)
+              if (response instanceof Response) {
+                const failure = await responseFailure(response)
+                if (failure) {
+                  if (event.status === 'pending') {
+                    await this.ctx.storage.delete(eventKey(event.sequence))
+                    continue
+                  }
+                  throw new Error(`Persisted ${event.kind} event ${event.sequence} failed replay: ${failure}`)
+                }
               }
+              if (event.status === 'pending') await this.#accept(event)
+            } catch (error) {
+              if (event.status === 'pending' && expectedRejection(error)) {
+                await this.ctx.storage.delete(eventKey(event.sequence))
+                continue
+              }
+              throw error
             }
           }
         } catch (error) {
@@ -228,13 +242,17 @@ export class Floor extends DurableObject<Env> {
   async #append(input: EventInput): Promise<{ key: string; event: StoredEvent }> {
     return this.ctx.storage.transaction(async (storage) => {
       const sequence = (await storage.get<number>(NEXT_SEQUENCE)) ?? 0
-      const event = { version: 1 as const, sequence, ...input } as StoredEvent
+      const event = { version: 1 as const, sequence, status: 'pending' as const, ...input } as StoredEvent
       const key = eventKey(sequence)
       // Failed events are deleted but this counter is not rewound. Gaps retain
       // the order of later accepted inputs and are intentionally harmless.
       await storage.put({ [key]: event, [NEXT_SEQUENCE]: sequence + 1 })
       return { key, event }
     })
+  }
+
+  async #accept(event: StoredEvent): Promise<void> {
+    await this.ctx.storage.put(eventKey(event.sequence), { ...event, status: 'accepted' })
   }
 
   async #mutate(
@@ -251,6 +269,8 @@ export class Floor extends DurableObject<Env> {
         const response = await this.#apply(stored.event, state)
         if (response instanceof Response && (await responseFailure(response))) {
           await this.ctx.storage.delete(stored.key)
+        } else {
+          await this.#accept(stored.event)
         }
         return response instanceof Response ? response : json(response)
       } catch (error) {
@@ -332,6 +352,10 @@ async function responseFailure(response: Response): Promise<string | undefined> 
   } catch {
     return undefined
   }
+}
+
+function expectedRejection(error: unknown): boolean {
+  return error instanceof ListingError || error instanceof RegistryError || error instanceof ReplyError
 }
 
 async function read<T>(request: Request): Promise<T> {

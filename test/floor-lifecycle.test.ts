@@ -33,8 +33,11 @@ class FakeStorage {
     return this.values.get(key) as T | undefined
   }
 
-  async put(entries: Record<string, unknown>): Promise<void> {
-    for (const [key, value] of Object.entries(entries)) this.values.set(key, structuredClone(value))
+  async put(key: string, value: unknown): Promise<void>
+  async put(entries: Record<string, unknown>): Promise<void>
+  async put(keyOrEntries: string | Record<string, unknown>, value?: unknown): Promise<void> {
+    const entries = typeof keyOrEntries === 'string' ? { [keyOrEntries]: value } : keyOrEntries
+    for (const [key, entry] of Object.entries(entries)) this.values.set(key, structuredClone(entry))
   }
 
   async delete(key: string): Promise<boolean> {
@@ -114,6 +117,11 @@ test(
         (value) => typeof value === 'object' && value !== null && (value as { kind?: string }).kind === 'seed',
       ),
     ).toHaveLength(1)
+    expect(
+      [...storage.values.values()].find(
+        (value) => typeof value === 'object' && value !== null && (value as { kind?: string }).kind === 'seed',
+      ),
+    ).toHaveProperty('status', 'accepted')
     expect(initial.listings.some((listing) => (listing.stats?.asks ?? 0) > 0)).toBe(true)
 
     const beforeRejected = [...storage.values.keys()].filter((key) => key.startsWith('event:v1:'))
@@ -196,6 +204,33 @@ test(
     const response = await call(changed, '/market/facts')
     expect(response.status).toBe(500)
     expect(((await response.json()) as { error: string }).error).toMatch(/does not match.*reset.*Durable Object/i)
+  },
+  30_000,
+)
+
+test(
+  'cold replay removes a pending rejected mutation left by a crash before cleanup',
+  async () => {
+    const storage = new FakeStorage()
+    await answer<MarketFacts>(await call(openFloor(storage), '/market/facts'))
+
+    const sequence = storage.values.get('meta:event-sequence:v1') as number
+    const key = `event:v1:${sequence.toString().padStart(12, '0')}`
+    await storage.put({
+      [key]: {
+        version: 1,
+        sequence,
+        status: 'pending',
+        kind: 'rpc',
+        at: Date.now(),
+        body: JSON.stringify({ action: 'process', block: {} }),
+      },
+      'meta:event-sequence:v1': sequence + 1,
+    })
+
+    const facts = await answer<MarketFacts>(await call(openFloor(storage), '/market/facts'))
+    expect(facts.listings).toHaveLength(6)
+    expect(storage.values.has(key)).toBe(false)
   },
   30_000,
 )
