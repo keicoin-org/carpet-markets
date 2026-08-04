@@ -12,7 +12,7 @@
  * generation plus that tail.  Inactive chunks are never authoritative.
  */
 
-import { hashBlock, type BlockBody } from '@keicoin/core'
+import { canonicalJson, hashBlock, type BlockBody } from '@keicoin/core'
 
 export type EventInput =
   | { at: number; kind: 'seed'; registryAddress: string }
@@ -36,6 +36,8 @@ export interface LogLimits {
   replayEvents: number
   replayBytes: number
   compactAfter: number
+  rawEvents: number
+  rawBytes: number
 }
 
 export const LOG_LIMITS: LogLimits = {
@@ -49,6 +51,16 @@ export const LOG_LIMITS: LogLimits = {
   replayEvents: 16,
   replayBytes: 16 * 1024,
   compactAfter: 8,
+  // What `event:v1:*` may actually hold in compact mode, which is not what
+  // replay folds those rows into. A generation retains the compaction cycle
+  // after its predecessor and admits at most one more cycle before the next
+  // checkpoint reclaims the older one, so two cycles is the whole working set:
+  // 2 * compactAfter rows, and twice replayBytes because that tail may still
+  // hold duplicates canonicalisation has not folded away yet. Rows an activated
+  // checkpoint already covers are invisible to canonical history, so this is
+  // the only bound that a failed cleanup cannot walk past.
+  rawEvents: 16,
+  rawBytes: 32 * 1024,
 }
 
 export const EVENT_PREFIX = 'event:v1:'
@@ -110,11 +122,37 @@ export function eventBytes(event: StoredEvent): number {
   return new TextEncoder().encode(JSON.stringify(event)).byteLength
 }
 
-export function logSize(events: readonly StoredEvent[]): { events: number; bytes: number } {
+export interface LogUsage {
+  events: number
+  bytes: number
+}
+
+export function logSize(events: readonly StoredEvent[]): LogUsage {
   return {
     events: events.length,
     bytes: events.reduce((total, event) => total + eventBytes(event), 0),
   }
+}
+
+/**
+ * The rows this object is really holding, read from storage rather than from
+ * replay's folded view of them.
+ *
+ * A checkpoint that activated but could not finish deleting the rows its
+ * retained predecessor covers leaves those rows out of every canonical
+ * measure: loaded authority is the checkpoint plus the tail after it. They are
+ * still persisted bytes, and they are what an admission bound has to count.
+ */
+export async function measureRawUsage(storage: LogStorage): Promise<LogUsage> {
+  const rows = await storage.list<StoredEvent>({ prefix: EVENT_PREFIX })
+  return logSize([...rows.values()])
+}
+
+export function rawLimitError(usage: LogUsage, limits = LOG_LIMITS): ReplayLimitError | undefined {
+  if (usage.events <= limits.rawEvents && usage.bytes <= limits.rawBytes) return undefined
+  return new ReplayLimitError(
+    `The mock market's durable event rows are full (${usage.events}/${limits.rawEvents} rows, ${usage.bytes}/${limits.rawBytes} bytes of persisted event:v1 storage, whatever replay folds them into). No ledger mutation was accepted. Compaction must reclaim the rows an activated checkpoint already covers before this object accepts new authority; reads and the current market state are unaffected.`,
+  )
 }
 
 export function assertWithinReplayLimits(events: readonly StoredEvent[], limits = LOG_LIMITS): void {
@@ -179,17 +217,16 @@ export function canonicalEvents(events: readonly StoredEvent[]): StoredEvent[] {
 /**
  * The identity of the ledger operation a `process` body asks for, if it is one.
  *
- * This is the ledger's own notion of the same block, not the request's bytes.
- * `MockLedger.process` hashes the body with `work` and `signature` removed and
- * returns a held block's hash before validating anything (@keicoin/core 0.3.0,
- * mock/ledger.ts), so a re-encoded — or re-signed — copy of an accepted block
- * is a no-op it recognises itself. Keying on the request text instead let one
- * accepted block be respelled into as many canonical rows as there was replay
- * budget, which no compaction can reclaim.
+ * This is the canonical JSON identity of the complete signed envelope, not the
+ * request's bytes. Whitespace and key order therefore cannot buy capacity, but
+ * changing or omitting `work` or `signature` is not silently treated as the
+ * accepted request. `MockLedger.process` returns a held body hash before it
+ * validates those fields, so the Durable Object has to keep this stricter
+ * boundary itself.
  *
- * Two genuinely distinct blocks hash differently and are never folded. Anything
- * that is not a `process` of a hashable block body returns undefined: `faucet`
- * pays out again on every call, and arbitrary bodies are left alone.
+ * Anything that is not a `process` carrying both signed-envelope fields returns
+ * undefined: `faucet` pays out again on every call, and unsigned/arbitrary
+ * bodies are left for validation or explicit conflict handling.
  */
 export function processInputIdentity(body: string): string | undefined {
   let input: { action?: unknown; block?: unknown }
@@ -201,9 +238,33 @@ export function processInputIdentity(body: string): string | undefined {
   if (input?.action !== 'process') return undefined
   if (!input.block || typeof input.block !== 'object' || Array.isArray(input.block)) return undefined
 
-  const { work: _work, signature: _signature, ...block } = input.block as Record<string, unknown>
+  const block = input.block as Record<string, unknown>
+  if (typeof block.work !== 'string' || typeof block.signature !== 'string') return undefined
   try {
-    return hashBlock(block as unknown as BlockBody)
+    return canonicalJson(block)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Consensus-body identity is used only to detect a conflicting replay of a
+ * block the ledger already holds. It never grants idempotent success: that
+ * requires `processInputIdentity()` to match the complete signed envelope.
+ */
+export function processBlockIdentity(body: string): string | undefined {
+  let input: { action?: unknown; block?: unknown }
+  try {
+    input = JSON.parse(body) as { action?: unknown; block?: unknown }
+  } catch {
+    return undefined
+  }
+  if (input?.action !== 'process') return undefined
+  if (!input.block || typeof input.block !== 'object' || Array.isArray(input.block)) return undefined
+
+  const { work: _work, signature: _signature, ...blockBody } = input.block as Record<string, unknown>
+  try {
+    return hashBlock(blockBody as unknown as BlockBody)
   } catch {
     return undefined
   }
@@ -267,8 +328,14 @@ export async function writeCheckpoint(
   const digest = await sha256(serialized)
   const chunks = chunkEvents(compacted)
   // The checkpoint semantically covers every input through this sequence,
-  // including redundant set/reply inputs removed by canonicalisation.
-  const throughSequence = events.reduce((last, event) => Math.max(last, event.sequence), -1)
+  // including redundant set/reply inputs removed by canonicalisation. Coverage
+  // never goes backwards: a successor written from already-canonical history
+  // still covers everything its predecessor did, which is what lets it
+  // authorise deleting the v1 log that first generation deliberately kept.
+  const throughSequence = Math.max(
+    events.reduce((last, event) => Math.max(last, event.sequence), -1),
+    current?.throughSequence ?? -1,
+  )
   const size = logSize(compacted)
   const manifest: CheckpointManifest = {
     version: 2,
@@ -303,15 +370,47 @@ export async function writeCheckpoint(
 
   // Keep the predecessor and every v1 row after it. That is a complete recovery
   // path if the newly active generation becomes unreadable.
-  if (current) {
-    const legacy = await storage.list<StoredEvent>({ prefix: EVENT_PREFIX })
-    const removable = [...legacy.entries()]
-      .filter(([, event]) => event.sequence <= current.throughSequence)
-      .map(([key]) => key)
-    await deleteKeys(storage, removable)
-  }
+  if (current) await removeCoveredRows(storage, current.throughSequence)
   await removeInactiveCheckpoints(storage, new Set([manifest.generation, current?.generation]))
   return manifest
+}
+
+export type ReclaimOutcome =
+  /** Cleanup is complete: nothing an activated pointer covers is still stored. */
+  | 'reclaimed'
+  /** No v2 pointer yet, so no row is covered by anything. */
+  | 'no-checkpoint'
+  /** One generation only; it deliberately retains the complete v1 log. */
+  | 'no-predecessor'
+  /** The retained predecessor no longer verifies, so its rows stay. */
+  | 'unverified-predecessor'
+
+/**
+ * Finish the cleanup an already-activated checkpoint authorises.
+ *
+ * Deleting the rows the retained predecessor covers is step 5 of the compaction
+ * sequence and nothing else, so repeating it after a crash or a failed delete
+ * is safe and writes nothing: the same keys, the same authority, no new
+ * generation. It is the difference between a transient cleanup failure and
+ * permanent raw growth, because a checkpoint that activated and then failed to
+ * clean up is indistinguishable from a healthy one at the next boot.
+ *
+ * It refuses to delete anything unless that predecessor still verifies. Rows it
+ * covers are the second recovery path; the active generation is the first.
+ * Reclaiming them against a predecessor that can no longer be read would leave
+ * exactly one, which is the one thing compaction must never do.
+ */
+export async function reclaimCoveredRows(storage: LogStorage): Promise<ReclaimOutcome> {
+  const pointers = await storage.get<CheckpointPointers>(CHECKPOINT_POINTERS)
+  if (!pointers || pointers.version !== 2) return 'no-checkpoint'
+  if (!pointers.previous) return 'no-predecessor'
+  if (!(await readCheckpoint(storage, pointers.previous))) return 'unverified-predecessor'
+  await removeCoveredRows(storage, pointers.previous.throughSequence)
+  await removeInactiveCheckpoints(
+    storage,
+    new Set([pointers.active.generation, pointers.previous.generation]),
+  )
+  return 'reclaimed'
 }
 
 export async function readBoundedText(request: Request, maxBytes = LOG_LIMITS.requestBytes): Promise<string> {
@@ -423,11 +522,50 @@ async function deleteKeys(storage: LogStorage, keys: string[]): Promise<void> {
   }
 }
 
+/**
+ * Cleanup is verified the same way the new generation was: by reading storage
+ * back. A delete that reports success and leaves the rows behind is a cleanup
+ * failure, and saying so is what stops the next boot from treating the object
+ * as reclaimed and writing another generation on top of the same rows.
+ */
+async function removeCoveredRows(storage: LogStorage, throughSequence: number): Promise<void> {
+  const removable = await coveredRowKeys(storage, throughSequence)
+  if (removable.length === 0) return
+  await deleteKeys(storage, removable)
+  const surviving = await coveredRowKeys(storage, throughSequence)
+  if (surviving.length > 0) {
+    throw new Error(
+      `Cleanup left ${surviving.length} event:v1 rows that the retained checkpoint through sequence ${throughSequence} already covers.`,
+    )
+  }
+}
+
+async function coveredRowKeys(storage: LogStorage, throughSequence: number): Promise<string[]> {
+  const rows = await storage.list<StoredEvent>({ prefix: EVENT_PREFIX })
+  return [...rows.entries()]
+    .filter(([, event]) => event.sequence <= throughSequence)
+    .map(([key]) => key)
+}
+
 async function removeInactiveCheckpoints(storage: LogStorage, keep: Set<number | undefined>): Promise<void> {
+  const removable = await inactiveCheckpointKeys(storage, keep)
+  if (removable.length === 0) return
+  await deleteKeys(storage, removable)
+  const surviving = await inactiveCheckpointKeys(storage, keep)
+  if (surviving.length > 0) {
+    throw new Error(
+      `Cleanup left ${surviving.length} rows of checkpoint generations that are neither active nor its retained predecessor.`,
+    )
+  }
+}
+
+async function inactiveCheckpointKeys(
+  storage: LogStorage,
+  keep: Set<number | undefined>,
+): Promise<string[]> {
   const rows = await storage.list({ prefix: CHECKPOINT_PREFIX })
-  const removable = [...rows.keys()].filter((key) => {
+  return [...rows.keys()].filter((key) => {
     const generation = Number(key.slice(CHECKPOINT_PREFIX.length).split(':', 1)[0])
     return !keep.has(generation)
   })
-  await deleteKeys(storage, removable)
 }

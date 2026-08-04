@@ -42,17 +42,21 @@ The policy is deliberately below the platform's storage ceiling:
 
 - request body: 4,096 bytes (about 4.9 times the largest measured accepted RPC);
 - replay authority: 16 accepted events and 16,384 serialized bytes;
+- persisted compact-mode `event:v1` working set: 16 rows and 32,768 bytes;
 - automatic checkpoint: every 8 accepted tail events;
 - cold replay target: at most 60 seconds in the pinned runtime workload.
 
 In `compact` mode both replay dimensions apply to the canonical accepted
-authority, after safe process/watch/reply folding. Raw legacy duplicates
-and a removable pending WAL row therefore cannot brick boot. The raw tail is
-bounded independently by fail-closed compaction: the event that reaches the
-8-event checkpoint threshold remains accepted in v1 authority, but if generation
-verification, pointer activation, or cleanup fails, later new mutations get HTTP
-507 without allocating a sequence or row. A retry of an accepted `process` block
-remains available because it needs no new authority. There is no silent
+authority, after safe process/watch/reply folding. The separate raw dimensions
+are measured from the actual persisted `event:v1` prefix before every new
+mutation, including rows an active checkpoint covers and replay no longer sees.
+Raw legacy duplicates and a removable pending WAL row therefore cannot brick
+boot, while persistent cleanup failure cannot grow hidden rows across evictions.
+The event that reaches the 8-event checkpoint threshold remains accepted in v1
+authority, but if generation verification, pointer activation, or cleanup fails,
+later new mutations get HTTP 507 without allocating a sequence or row. An exact
+complete-envelope retry of an accepted `process` block remains available because
+it needs no new authority. There is no silent
 truncation. An over-limit compact-mode mutation likewise gets HTTP 507 and says
 that the ledger did not accept it; an oversized request gets HTTP 413 before a
 durable row is written in either mode. The limits are small because the
@@ -80,10 +84,11 @@ The compaction sequence is:
 
 1. Canonicalise accepted signed `process` retries, duplicate `watch` inputs, and
    replies older than the existing 100-per-asset thread tail. A `process` retry
-   is identified by the ledger's own block hash — the body with `work` and
-   `signature` removed, which is what `MockLedger.process` recognises as a block
-   it already holds — so a re-encoded copy cannot buy a second row. Distinct
-   blocks hash differently; never rewrite distinct RPC, seed, or launch order.
+   is identified by canonical JSON of the complete block envelope, including
+   `work` and `signature`, so whitespace/key order cannot buy a second row but an
+   unsigned or conflicting envelope is never silently granted success. A body
+   the ledger already holds with a different envelope is explicitly refused
+   before WAL admission. Never rewrite distinct RPC, seed, or launch order.
 2. Write immutable chunks and their manifest as an inactive generation.
 3. Read every chunk back and verify count, bytes, registry identity, and digest.
 4. Atomically switch the one pointer, retaining the old active manifest as the
@@ -92,10 +97,21 @@ The compaction sequence is:
    generations older than active/previous.
 
 A crash before step 4 leaves v1/the old pointer authoritative. A crash after
-step 4 leaves the new verified generation authoritative; incomplete cleanup is
-only extra storage. If the active chunks later fail verification, boot uses the
-previous checkpoint plus the surviving v1 tail. Pending WAL events remain in
-that tail and retain the existing accept-or-delete replay behavior.
+step 4 leaves the new verified generation authoritative. On the next compact
+boot, a verified active/predecessor pair retries only the idempotent cleanup it
+already authorises before admitting traffic; a persistent cleanup error latches
+HTTP 507 again, so eviction cannot reopen unbounded writes. If the active chunks
+later fail verification, boot uses the previous checkpoint plus the surviving
+v1 tail and skips cleanup. Pending WAL events remain in that tail and retain the
+existing accept-or-delete replay behavior.
+
+Application and WAL acceptance are also separate failure boundaries. Once an
+application succeeds, failure to rewrite its row from `pending` to `accepted`
+never deletes that row: the already-mutated live instance refuses further new
+mutations with HTTP 503, while reads and exact retries of previously accepted
+signed blocks remain available. A cold instance rebuilds disposable state,
+applies the retained pending row once, and completes its acceptance write. Only
+an application failure known to be atomic may delete its pending row.
 
 ## Two-release rollout and rollback floor
 
@@ -122,7 +138,9 @@ traffic before writing mock authority.
    checkpoint/deletion occurs, and new mutations return 507 until configuration
    returns to `compat`. Observe two successful generations before calling
    storage reclaimed; the first generation intentionally keeps the complete v1
-   log.
+   log. If that legacy log is already beyond the compact raw bound but remains
+   canonically safe, boot writes and verifies the immediate successor generation
+   needed to reclaim it before admitting a new mutation.
 5. Roll back only to the checkpoint-aware floor (with `compat` if compaction
    needs to pause). It reads the active checkpoint and continues appending a v1
    tail without deleting more history.
@@ -133,10 +151,12 @@ Alert
 on replay time approaching 60 seconds, either replay bound approaching 80%, any
 `compaction` record with `ok:false`, or `recoveredFrom` being non-null. Records
 include event count/bytes by kind, accepted bytes for the request and trailing
-minute, tail count, checkpoint generation, replay time, and all active limits.
-After a failed compaction, preserve the object and repair the cause; new
-mutations deliberately remain fail-closed until a later cold boot can complete a
-checkpoint successfully.
+minute, actual persisted raw rows/bytes, tail count, checkpoint generation,
+replay time, and all active limits. `reclaim` records distinguish completed,
+skipped, and failed post-activation cleanup. After a failed compaction or
+reclamation, preserve the object and repair the cause; new mutations deliberately
+remain fail-closed until a later cold boot can verify and finish the authorised
+cleanup or checkpoint successfully.
 
 ## Recovery and reset
 

@@ -4,10 +4,15 @@ import { keyPairFromSeed } from '@keicoin/core'
 import {
   CHECKPOINT_POINTERS,
   EVENT_PREFIX,
+  LOG_LIMITS,
   canonicalEvents,
   eventKey,
   loadLog,
+  logSize,
+  measureRawUsage,
+  rawLimitError,
   readBoundedText,
+  reclaimCoveredRows,
   writeCheckpoint,
   type LogStorage,
   type StoredEvent,
@@ -17,6 +22,9 @@ class MemoryStorage implements LogStorage {
   readonly values = new Map<string, unknown>()
   failPointer = false
   failDelete = false
+  failCheckpointDelete = false
+  /** A delete that reports success and removes nothing. */
+  silentDelete = false
 
   async get<T>(key: string): Promise<T | undefined>
   async get<T>(keys: string[]): Promise<Map<string, T>>
@@ -46,6 +54,10 @@ class MemoryStorage implements LogStorage {
 
   async delete(keys: string[]): Promise<number> {
     if (this.failDelete) throw new Error('simulated cleanup crash')
+    if (this.failCheckpointDelete && keys.some((key) => key.startsWith('checkpoint:v2:'))) {
+      throw new Error('simulated inactive-checkpoint cleanup crash')
+    }
+    if (this.silentDelete) return keys.length
     let deleted = 0
     for (const key of keys) if (this.values.delete(key)) deleted += 1
     return deleted
@@ -78,6 +90,10 @@ function watch(sequence: number, address = 'kei_watcher'): StoredEvent {
   return { version: 1, sequence, status: 'accepted', kind: 'watch', at: sequence, address }
 }
 
+function rawRows(storage: MemoryStorage): string[] {
+  return [...storage.values.keys()].filter((key) => key.startsWith(EVENT_PREFIX)).sort()
+}
+
 async function storeLegacy(storage: MemoryStorage, events: StoredEvent[]): Promise<void> {
   const rows: Record<string, StoredEvent> = {}
   for (const event of events) rows[eventKey(event.sequence)] = event
@@ -98,10 +114,14 @@ describe('durable replay checkpoints', () => {
       work: 'abc',
       signature: 'F'.repeat(128),
     }
-    // The same block the ledger already holds, spelled three ways a client or a
-    // proxy could legitimately produce, plus one genuinely different block.
+    // The same complete signed envelope spelled three ways, one conflicting
+    // signature for the same block body, and one genuinely different block.
     const asPosted = JSON.stringify({ action: 'process', block })
     const reEncoded = JSON.stringify({ action: 'process', block }, null, 2)
+    const reordered = JSON.stringify({
+      block: Object.fromEntries(Object.entries(block).reverse()),
+      action: 'process',
+    })
     const reSigned = JSON.stringify({ action: 'process', block: { ...block, signature: '0'.repeat(128) } })
     const distinct = JSON.stringify({ action: 'process', block: { ...block, link: 'B'.repeat(64) } })
 
@@ -122,7 +142,7 @@ describe('durable replay checkpoints', () => {
         },
       })
     }
-    for (const [offset, body] of [asPosted, reEncoded, reSigned, distinct].entries()) {
+    for (const [offset, body] of [asPosted, reEncoded, reordered, reSigned, distinct].entries()) {
       events.push({
         version: 1,
         sequence: 108 + offset,
@@ -136,11 +156,12 @@ describe('durable replay checkpoints', () => {
     const compacted = canonicalEvents(events)
     expect(compacted.filter((event) => event.kind === 'watch').map((event) => event.sequence)).toEqual([1])
     expect(compacted.filter((event) => event.kind === 'reply')).toHaveLength(100)
-    // The first spelling of the block that moved the ledger, and the other
-    // block. Re-encoding and re-signing buy nothing.
+    // Re-encoding/key order folds, but a different signature is not silently
+    // equated with the accepted envelope, and a different block remains distinct.
     expect(compacted.filter((event) => event.kind === 'rpc').map((event) => event.sequence)).toEqual([
       108,
       111,
+      112,
     ])
   })
 
@@ -196,6 +217,120 @@ describe('durable replay checkpoints', () => {
     const loaded = await loadLog(storage)
     expect(loaded.checkpoint?.generation).toBe(2)
     expect(canonicalEvents(loaded.events)).toEqual(canonicalEvents([...firstEvents, ...tail]))
+  })
+
+  test('raw usage counts stored rows that canonical replay no longer looks at', async () => {
+    const storage = new MemoryStorage()
+    const firstEvents = [seed(), ...Array.from({ length: 7 }, (_, index) => watch(index + 1))]
+    await storeLegacy(storage, firstEvents)
+    const first = await writeCheckpoint(storage, firstEvents, undefined)
+    const tail = Array.from({ length: 8 }, (_, index) => watch(8 + index, `kei_${index}`))
+    await storeLegacy(storage, tail)
+    const second = await writeCheckpoint(storage, [...canonicalEvents(firstEvents), ...tail], first)
+    expect(rawRows(storage)).toHaveLength(8)
+
+    // Exactly what a cleanup failure after pointer activation leaves behind:
+    // rows the active generation already covers.
+    await storeLegacy(storage, firstEvents)
+
+    const loaded = await loadLog(storage)
+    expect(loaded.checkpoint?.generation).toBe(second.generation)
+    expect(loaded.recoveredFrom).toBeUndefined()
+    expect(loaded.tailEvents).toBe(0)
+    // Canonical replay is unchanged by them, which is the whole problem: they
+    // are persisted bytes that no canonical measure can see.
+    expect(loaded.events).toHaveLength(10)
+    const usage = await measureRawUsage(storage)
+    expect(usage).toEqual(logSize([...firstEvents, ...tail]))
+    expect(usage.events).toBe(16)
+    expect(rawLimitError(usage)).toBeUndefined()
+    expect(rawLimitError({ events: usage.events + 1, bytes: usage.bytes })).toMatchObject({ status: 507 })
+    expect(rawLimitError({ events: usage.events, bytes: LOG_LIMITS.rawBytes + 1 })).toMatchObject({
+      status: 507,
+    })
+
+    // Finishing the cleanup is a delete of the same covered keys, nothing else.
+    const pointers = structuredClone(storage.values.get(CHECKPOINT_POINTERS))
+    expect(await reclaimCoveredRows(storage)).toBe('reclaimed')
+    expect(await measureRawUsage(storage)).toEqual(logSize(tail))
+    expect(storage.values.get(CHECKPOINT_POINTERS)).toEqual(pointers)
+    expect((await loadLog(storage)).events).toEqual(loaded.events)
+  })
+
+  test('reclamation keeps covered rows when the retained predecessor cannot be verified', async () => {
+    const storage = new MemoryStorage()
+    const firstEvents = [seed(), watch(1)]
+    await storeLegacy(storage, firstEvents)
+    const first = await writeCheckpoint(storage, firstEvents, undefined)
+    const tail = [watch(2, 'kei_other')]
+    await storeLegacy(storage, tail)
+    await writeCheckpoint(storage, [...firstEvents, ...tail], first)
+    await storeLegacy(storage, firstEvents)
+
+    const damaged = [...storage.values.keys()].find((key) => key.includes('checkpoint:v2:00000001:chunk:'))!
+    storage.values.delete(damaged)
+
+    // Those rows are the second recovery path. Reclaiming them against a
+    // predecessor that no longer reads would leave exactly one.
+    const before = rawRows(storage)
+    expect(await reclaimCoveredRows(storage)).toBe('unverified-predecessor')
+    expect(rawRows(storage)).toEqual(before)
+  })
+
+  test('a cleanup that reports success and removes nothing is a compaction failure', async () => {
+    const storage = new MemoryStorage()
+    const firstEvents = [seed(), watch(1)]
+    await storeLegacy(storage, firstEvents)
+    const first = await writeCheckpoint(storage, firstEvents, undefined)
+    const tail = [watch(2, 'kei_other')]
+    await storeLegacy(storage, tail)
+    storage.silentDelete = true
+
+    await expect(writeCheckpoint(storage, [...firstEvents, ...tail], first)).rejects.toThrow(
+      /Cleanup left 2 event:v1 rows/,
+    )
+    storage.silentDelete = false
+    // The generation still activated, so the next boot reclaims rather than
+    // stacking another generation on rows it has proved it cannot remove.
+    expect((await loadLog(storage)).checkpoint?.generation).toBe(2)
+    expect(await reclaimCoveredRows(storage)).toBe('reclaimed')
+    expect(await measureRawUsage(storage)).toMatchObject({ events: 1 })
+  })
+
+  test('inactive-generation cleanup is restart-safe and does not stack generations', async () => {
+    const storage = new MemoryStorage()
+    const firstEvents = [seed(), watch(1)]
+    await storeLegacy(storage, firstEvents)
+    const first = await writeCheckpoint(storage, firstEvents, undefined)
+
+    const secondTail = [watch(2, 'kei_second')]
+    await storeLegacy(storage, secondTail)
+    const secondEvents = [...canonicalEvents(firstEvents), ...secondTail]
+    const second = await writeCheckpoint(storage, secondEvents, first)
+
+    const thirdTail = [watch(3, 'kei_third')]
+    await storeLegacy(storage, thirdTail)
+    storage.failCheckpointDelete = true
+    await expect(
+      writeCheckpoint(storage, [...canonicalEvents(secondEvents), ...thirdTail], second),
+    ).rejects.toThrow('inactive-checkpoint cleanup crash')
+
+    const pointerAfterFailure = structuredClone(storage.values.get(CHECKPOINT_POINTERS))
+    expect(pointerAfterFailure).toMatchObject({ active: { generation: 3 }, previous: { generation: 2 } })
+    const checkpointRows = () =>
+      [...storage.values.keys()].filter((key) => key.startsWith('checkpoint:v2:')).sort()
+    expect(checkpointRows()).toHaveLength(6)
+
+    // A persistent failure repeats only cleanup; it does not write generation 4.
+    await expect(reclaimCoveredRows(storage)).rejects.toThrow('inactive-checkpoint cleanup crash')
+    expect(checkpointRows()).toHaveLength(6)
+    expect(storage.values.get(CHECKPOINT_POINTERS)).toEqual(pointerAfterFailure)
+
+    storage.failCheckpointDelete = false
+    expect(await reclaimCoveredRows(storage)).toBe('reclaimed')
+    expect(checkpointRows()).toHaveLength(4)
+    expect(storage.values.get(CHECKPOINT_POINTERS)).toEqual(pointerAfterFailure)
+    expect((await loadLog(storage)).events).toEqual(canonicalEvents([...secondEvents, ...thirdTail]))
   })
 
   test('streaming request limits reject before retaining an oversized body', async () => {

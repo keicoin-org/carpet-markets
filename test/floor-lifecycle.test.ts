@@ -3,6 +3,7 @@ import { HttpNode, keyPairFromSeed, signHash } from '@keicoin/core'
 import { Kei } from 'kei-transaction'
 
 import { cleanReply, replyHash } from '../shared/social.js'
+import { LOG_LIMITS, rawLimitError } from '../worker/durable-log.js'
 import type { Book, Holder, MarketFacts } from '../shared/listing.js'
 import type { Reply } from '../shared/social.js'
 
@@ -29,6 +30,14 @@ const { Floor } = (await import('../worker/' + 'index.ts')) as {
 class FakeStorage {
   readonly values = new Map<string, unknown>()
   failPointer = false
+  failAcceptedPut = false
+  /**
+   * Fail exactly the step that can only fail after a checkpoint pointer is
+   * already authoritative: deleting the v1 rows the retained predecessor
+   * covers. Single-key deletes (a rejected mutation's own WAL row) still work,
+   * so this isolates post-activation cleanup from ordinary write handling.
+   */
+  failCoveredCleanup = false
 
   async get<T>(key: string): Promise<T | undefined>
   async get<T>(keys: string[]): Promise<Map<string, T>>
@@ -46,6 +55,19 @@ class FakeStorage {
   async put(keyOrEntries: string | Record<string, unknown>, value?: unknown): Promise<void> {
     const entries = typeof keyOrEntries === 'string' ? { [keyOrEntries]: value } : keyOrEntries
     if (this.failPointer && 'meta:checkpoint:v2' in entries) throw new Error('simulated pointer failure')
+    if (
+      this.failAcceptedPut &&
+      Object.entries(entries).some(
+        ([key, entry]) =>
+          key.startsWith('event:v1:') &&
+          typeof entry === 'object' &&
+          entry !== null &&
+          (entry as { status?: unknown }).status === 'accepted',
+      )
+    ) {
+      this.failAcceptedPut = false
+      throw new Error('simulated accepted-status write failure')
+    }
     for (const [key, entry] of Object.entries(entries)) this.values.set(key, structuredClone(entry))
   }
 
@@ -53,6 +75,9 @@ class FakeStorage {
   async delete(keys: string[]): Promise<number>
   async delete(keyOrKeys: string | string[]): Promise<boolean | number> {
     if (typeof keyOrKeys === 'string') return this.values.delete(keyOrKeys)
+    if (this.failCoveredCleanup && keyOrKeys.some((key) => key.startsWith('event:v1:'))) {
+      throw new Error('simulated post-activation cleanup failure')
+    }
     let deleted = 0
     for (const key of keyOrKeys) if (this.values.delete(key)) deleted += 1
     return deleted
@@ -130,6 +155,40 @@ function postBody(floor: FloorLike, body: string): Promise<Response> {
 
 function eventRows(storage: FakeStorage): string[] {
   return [...storage.values.keys()].filter((key) => key.startsWith('event:v1:'))
+}
+
+/**
+ * A row a deployed compat object really would have accepted: `watch` ignores
+ * anything that is not an address, and the input is still stored. Repeating one
+ * of them is set-like, so canonicalisation folds the whole pile to one event
+ * while the raw bytes stay on disk.
+ */
+const LEGACY_FILLER = `not-an-address-${'x'.repeat(1600)}`
+
+function storeOversizedLegacy(storage: FakeStorage, rows: number): void {
+  for (let sequence = 1; sequence <= rows; sequence += 1) {
+    storage.values.set(`event:v1:${sequence.toString().padStart(12, '0')}`, {
+      version: 1,
+      sequence,
+      status: 'accepted',
+      kind: 'watch',
+      at: sequence,
+      address: LEGACY_FILLER,
+    })
+  }
+  storage.values.set('meta:event-sequence:v1', rows + 1)
+}
+
+/** What the object actually persists, which is not what replay folds it into. */
+function rawStorage(storage: FakeStorage): { events: number; bytes: number } {
+  const rows = [...storage.values.entries()].filter(([key]) => key.startsWith('event:v1:'))
+  return {
+    events: rows.length,
+    bytes: rows.reduce(
+      (total, [, value]) => total + new TextEncoder().encode(JSON.stringify(value)).byteLength,
+      0,
+    ),
+  }
 }
 
 test(
@@ -272,6 +331,70 @@ test(
 )
 
 test(
+  'an accepted-status write failure preserves pending authority and fails closed until cold replay',
+  async () => {
+    const storage = new FakeStorage()
+    const floor = openFloor(storage)
+    const facts = await answer<MarketFacts>(await call(floor, '/market/facts'))
+    const asset = facts.listings[0]!.asset
+    const keys = await keyPairFromSeed('3F'.repeat(32), 0)
+    const body = cleanReply('acceptance failure survived exactly once')
+    const at = Date.now()
+    const reply = {
+      asset,
+      author: keys.address,
+      body,
+      at,
+      signature: await signHash(keys.privateKey, replyHash({ asset, body, at })),
+    }
+    const sequence = storage.values.get('meta:event-sequence:v1') as number
+    const pendingKey = `event:v1:${sequence.toString().padStart(12, '0')}`
+
+    storage.failAcceptedPut = true
+    const failed = await call(floor, '/market/reply', reply)
+    expect(failed.status).toBe(503)
+    expect((await failed.json()) as { error: string }).toMatchObject({
+      error: expect.stringMatching(/pending row was preserved.*cold restart/i),
+    })
+    expect(storage.values.get(pendingKey)).toMatchObject({ kind: 'reply', status: 'pending' })
+    expect(storage.values.get('meta:event-sequence:v1')).toBe(sequence + 1)
+
+    // The application was observable before its acceptance write failed. A
+    // retry on this same live instance must neither apply it again nor allocate
+    // another WAL row while durable authority is unresolved.
+    expect(
+      (await answer<{ replies: Reply[] }>(await call(floor, `/market/replies?asset=${asset}`))).replies.map(
+        (entry) => entry.body,
+      ).filter((entry) => entry === body),
+    ).toEqual([body])
+    const keysAtFailure = [...storage.values.keys()]
+    const refusedRetry = await call(floor, '/market/reply', reply)
+    expect(refusedRetry.status).toBe(503)
+    expect((await refusedRetry.json()) as { error: string }).toMatchObject({
+      error: expect.stringMatching(/pending row was preserved.*cold restart/i),
+    })
+    expect([...storage.values.keys()]).toEqual(keysAtFailure)
+    expect(storage.values.get('meta:event-sequence:v1')).toBe(sequence + 1)
+
+    // A fresh instance rebuilds disposable state, applies the one pending row,
+    // marks it accepted, and remains stable across another eviction.
+    const reopened = openFloor(storage)
+    const recovered = await answer<{ replies: Reply[] }>(await call(reopened, `/market/replies?asset=${asset}`))
+    expect(recovered.replies.map((entry) => entry.body).filter((entry) => entry === body)).toEqual([body])
+    expect(storage.values.get(pendingKey)).toMatchObject({ kind: 'reply', status: 'accepted' })
+    const rowsAfterRecovery = eventRows(storage)
+
+    const evictedAgain = openFloor(storage)
+    const replayed = await answer<{ replies: Reply[] }>(
+      await call(evictedAgain, `/market/replies?asset=${asset}`),
+    )
+    expect(replayed.replies.map((entry) => entry.body).filter((entry) => entry === body)).toEqual([body])
+    expect(eventRows(storage)).toEqual(rowsAfterRecovery)
+  },
+  60_000,
+)
+
+test(
   'compat audits oversized legacy state without deleting it, while compact refuses unsafe activation',
   async () => {
     const base = new FakeStorage()
@@ -279,34 +402,38 @@ test(
 
     const compat = new FakeStorage()
     for (const [key, value] of base.values) compat.values.set(key, structuredClone(value))
-    for (let sequence = 1; sequence <= 20; sequence += 1) {
-      compat.values.set(`event:v1:${sequence.toString().padStart(12, '0')}`, {
-        version: 1,
-        sequence,
-        status: 'accepted',
-        kind: 'watch',
-        at: sequence,
-        address: 'kei_same_legacy_watcher',
-      })
-    }
-    const pendingKey = 'event:v1:000000000021'
+    storeOversizedLegacy(compat, 24)
+    const pendingKey = 'event:v1:000000000025'
     compat.values.set(pendingKey, {
       version: 1,
-      sequence: 21,
+      sequence: 25,
       status: 'pending',
       kind: 'rpc',
-      at: 21,
+      at: 25,
       body: JSON.stringify({ action: 'process', block: {} }),
     })
-    compat.values.set('meta:event-sequence:v1', 22)
+    compat.values.set('meta:event-sequence:v1', 26)
     const acceptedBefore = [...compat.values.keys()].filter((key) => key.startsWith('event:v1:') && key !== pendingKey)
+
+    // Past both compact-mode raw dimensions. Compatibility mode has no such
+    // ceiling: it reads and writes this log exactly as the deployed version did.
+    const legacyUsage = rawStorage(compat)
+    expect(legacyUsage.events).toBeGreaterThan(LOG_LIMITS.rawEvents)
+    expect(legacyUsage.bytes).toBeGreaterThan(LOG_LIMITS.rawBytes)
 
     const compatible = openFloor(compat, { CARPET_NETWORK: 'mock', CARPET_LOG_MODE: 'compat' })
     expect((await answer<MarketFacts>(await call(compatible, '/market/facts'))).listings).toHaveLength(6)
     expect(compat.values.has(pendingKey)).toBe(false)
     expect(acceptedBefore.every((key) => compat.values.has(key))).toBe(true)
-    await answer(await call(compatible, '/market/watch', { address: 'kei_compat_still_accepts_writes' }))
-    expect(compat.values.get('meta:event-sequence:v1')).toBe(23)
+    for (let index = 0; index < 3; index += 1) {
+      expect(
+        await answer<{ watching: boolean }>(
+          await call(compatible, '/market/watch', { address: `kei_compat_still_accepts_writes_${index}` }),
+        ),
+      ).toEqual({ watching: true })
+    }
+    expect(compat.values.get('meta:event-sequence:v1')).toBe(29)
+    expect(rawStorage(compat).events).toBe(acceptedBefore.length + 3)
     expect([...compat.values.keys()].some((key) => key.startsWith('checkpoint:v2:'))).toBe(false)
 
     const oversized = new FakeStorage()
@@ -383,7 +510,174 @@ test(
 )
 
 test(
-  'a re-encoded copy of an accepted signed block is one operation and buys no authority',
+  'an oversized compat log activates compact by reclaiming it, not by losing it',
+  async () => {
+    const base = new FakeStorage()
+    await answer<MarketFacts>(await call(openFloor(base), '/market/facts'))
+
+    const migrating = new FakeStorage()
+    for (const [key, value] of base.values) migrating.values.set(key, structuredClone(value))
+    storeOversizedLegacy(migrating, 24)
+
+    // What the checkpoint-aware rollback floor reads in compat, for comparison.
+    const reference = await answer<MarketFacts>(
+      await call(
+        openFloor(migrating, { CARPET_NETWORK: 'mock', CARPET_LOG_MODE: 'compat' }),
+        '/market/facts',
+      ),
+    )
+    const oversized = rawStorage(migrating)
+    expect(oversized.events).toBeGreaterThan(LOG_LIMITS.rawEvents)
+    expect(oversized.bytes).toBeGreaterThan(LOG_LIMITS.rawBytes)
+
+    const compacting = openFloor(migrating, { CARPET_NETWORK: 'mock', CARPET_LOG_MODE: 'compact' })
+    const migrated = await answer<MarketFacts>(await call(compacting, '/market/facts'))
+    expect(migrated.address).toBe(reference.address)
+    expect(migrated.listings.map((listing) => listing.asset)).toEqual(
+      reference.listings.map((listing) => listing.asset),
+    )
+
+    // The first generation deliberately keeps the complete v1 log, so the
+    // reclamation is its verified successor. Both remain readable afterwards.
+    const pointers = migrating.values.get('meta:checkpoint:v2') as {
+      active: { generation: number; eventCount: number; registryAddress: string; throughSequence: number }
+      previous: { generation: number; throughSequence: number }
+    }
+    expect(pointers).toMatchObject({ active: { generation: 2 }, previous: { generation: 1 } })
+    expect(pointers.active.registryAddress).toBe(reference.address)
+    expect(pointers.active.throughSequence).toBe(24)
+    expect(pointers.active.eventCount).toBe(2)
+    expect(
+      [...migrating.values.keys()].filter((key) => key.startsWith('checkpoint:v2:00000001:')).length,
+    ).toBeGreaterThan(0)
+    expect(rawStorage(migrating)).toEqual({ events: 0, bytes: 0 })
+
+    // And it is an open market again, not a fail-closed one.
+    const asset = migrated.listings.find((listing) => listing.symbol === 'FRINGE')!.asset
+    expect(await answer<Book>(await call(compacting, `/market/book?asset=${asset}`))).toMatchObject({ asset })
+    expect(
+      await answer<{ watching: boolean }>(
+        await call(compacting, '/market/watch', { address: (await keyPairFromSeed('43'.repeat(32), 0)).address }),
+      ),
+    ).toEqual({ watching: true })
+    expect(rawStorage(migrating).events).toBe(1)
+  },
+  120_000,
+)
+
+test(
+  'v1 cleanup failing after pointer activation cannot grow raw storage across restarts',
+  async () => {
+    const storage = new FakeStorage()
+    storage.failCoveredCleanup = true
+    // One real address, posted over and over. Canonicalisation folds it to a
+    // single accepted event, so the canonical replay bound never refuses any of
+    // this; only the rows the object actually persists grow.
+    const watcher = (await keyPairFromSeed('41'.repeat(32), 0)).address
+
+    const cycles: { events: number; bytes: number; accepted: number }[] = []
+    let opening: MarketFacts | undefined
+    for (let cycle = 0; cycle < 5; cycle += 1) {
+      const floor = openFloor(storage, { CARPET_NETWORK: 'mock', CARPET_LOG_MODE: 'compact' })
+      const facts = await answer<MarketFacts>(await call(floor, '/market/facts'))
+      opening ??= facts
+      expect(facts.address).toBe(opening.address)
+      expect(facts.listings.map((listing) => listing.asset)).toEqual(
+        opening.listings.map((listing) => listing.asset),
+      )
+
+      const sequenceBefore = storage.values.get('meta:event-sequence:v1') as number
+      let accepted = 0
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const response = await call(floor, '/market/watch', { address: watcher })
+        if (response.ok) {
+          expect(await response.json()).toEqual({ watching: true })
+          accepted += 1
+          continue
+        }
+        expect(response.status).toBe(507)
+        expect((await response.json()) as { error: string }).toHaveProperty('error')
+      }
+      // A refusal costs no sequence and no WAL row, in every cycle.
+      expect(storage.values.get('meta:event-sequence:v1')).toBe(sequenceBefore + accepted)
+      cycles.push({ ...rawStorage(storage), accepted })
+    }
+
+    // The defect: each restart cleared an in-memory latch, accepted another
+    // compaction cycle of writes, and left its covered rows behind again. Row
+    // 17 is where this object stops, in every life it has.
+    expect(cycles.map((cycle) => cycle.events)).toEqual([16, 16, 16, 16, 16])
+    expect(cycles.map((cycle) => cycle.accepted)).toEqual([15, 0, 0, 0, 0])
+    for (const cycle of cycles) {
+      expect(cycle.events).toBeLessThanOrEqual(LOG_LIMITS.rawEvents)
+      expect(cycle.bytes).toBeLessThanOrEqual(LOG_LIMITS.rawBytes)
+    }
+
+    // What refuses is the persisted measurement, projected before anything is
+    // allocated: the rows are inside the bound and one more would cross it.
+    const persisted = rawStorage(storage)
+    expect(rawLimitError(persisted)).toBeUndefined()
+    expect(rawLimitError({ events: persisted.events + 1, bytes: persisted.bytes })).toMatchObject({
+      status: 507,
+    })
+
+    // Reads and canonical state stay exactly available throughout.
+    const last = openFloor(storage, { CARPET_NETWORK: 'mock', CARPET_LOG_MODE: 'compact' })
+    const facts = await answer<MarketFacts>(await call(last, '/market/facts'))
+    expect(facts.listings).toHaveLength(6)
+    expect(facts.listings.map((listing) => listing.asset)).toEqual(
+      opening!.listings.map((listing) => listing.asset),
+    )
+    const asset = facts.listings.find((listing) => listing.symbol === 'FRINGE')!.asset
+    expect(await answer<Book>(await call(last, `/market/book?asset=${asset}`))).toMatchObject({
+      asset,
+    })
+  },
+  120_000,
+)
+
+test(
+  'a transient cleanup failure is finished by the next boot without resetting authority',
+  async () => {
+    const storage = new FakeStorage()
+    const watcher = (await keyPairFromSeed('42'.repeat(32), 0)).address
+    const floor = openFloor(storage, { CARPET_NETWORK: 'mock', CARPET_LOG_MODE: 'compact' })
+    const before = await answer<MarketFacts>(await call(floor, '/market/facts'))
+
+    storage.failCoveredCleanup = true
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      await call(floor, '/market/watch', { address: watcher })
+    }
+    // The second generation activated and could not delete the rows its
+    // predecessor covers, so this instance is fail-closed.
+    const pointers = structuredClone(storage.values.get('meta:checkpoint:v2'))
+    expect(pointers).toMatchObject({ active: { generation: 2 }, previous: { generation: 1 } })
+    expect(rawStorage(storage).events).toBe(16)
+    expect((await call(floor, '/market/watch', { address: watcher })).status).toBe(507)
+
+    storage.failCoveredCleanup = false
+    const reopened = openFloor(storage, { CARPET_NETWORK: 'mock', CARPET_LOG_MODE: 'compact' })
+    const after = await answer<MarketFacts>(await call(reopened, '/market/facts'))
+    expect(after.address).toBe(before.address)
+    expect(after.listings.map((listing) => listing.asset)).toEqual(
+      before.listings.map((listing) => listing.asset),
+    )
+
+    // Recovery is the delete that was owed, and nothing else: the same active
+    // generation, the same retained predecessor, no new checkpoint, and
+    // admission open again.
+    expect(rawStorage(storage).events).toBe(8)
+    expect(storage.values.get('meta:checkpoint:v2')).toEqual(pointers)
+    expect(
+      await answer<{ watching: boolean }>(await call(reopened, '/market/watch', { address: watcher })),
+    ).toEqual({ watching: true })
+    expect(rawStorage(storage).events).toBe(9)
+  },
+  120_000,
+)
+
+test(
+  'only the same complete signed envelope retries without buying authority',
   async () => {
     const storage = new FakeStorage()
     const floor = openFloor(storage, { CARPET_NETWORK: 'mock', CARPET_LOG_MODE: 'compact' })
@@ -404,15 +698,13 @@ test(
     const sequenceBefore = storage.values.get('meta:event-sequence:v1')
     const hash = await answer<{ hash: string }>(await postBody(floor, exact))
 
-    // `MockLedger.process` hashes the block body and returns a held block's hash
-    // before it validates anything, signature included (@keicoin/core 0.3.0,
-    // mock/ledger.ts). So none of these is a second ledger operation; only the
-    // request bytes differ. Re-encoding is ordinary client and proxy behaviour,
-    // and the tampered signature is the adversarial spelling of the same thing.
+    const reorderedBlock = Object.fromEntries(Object.entries(accepted.block).reverse())
+    // These are the same complete signed envelope. Ordinary client/proxy JSON
+    // formatting and key order must not buy another authority row.
     const copies = [
       JSON.stringify(accepted, null, 2),
       JSON.stringify({ block: accepted.block, action: accepted.action }),
-      JSON.stringify({ ...accepted, block: { ...accepted.block, signature: '0'.repeat(128) } }),
+      JSON.stringify({ block: reorderedBlock, action: accepted.action }),
       ...Array.from({ length: 16 }, (_, index) =>
         JSON.stringify(accepted).replace('{"action"', `{${' '.repeat(index + 1)}"action"`),
       ),
@@ -426,9 +718,35 @@ test(
       expect(await response.json()).toEqual(hash)
     }
 
+    // MockLedger itself returns a held block's hash before validating its
+    // envelope. The Durable Object must not turn that quirk into successful
+    // unsigned/tampered retries or hide the conflicting payload. They are
+    // refused explicitly and consume no row or sequence.
+    const { work: _work, signature: _signature, ...unsignedBlock } = accepted.block
+    const conflicts = [
+      JSON.stringify({ ...accepted, block: { ...accepted.block, signature: '0'.repeat(128) } }),
+      JSON.stringify({ ...accepted, block: { ...accepted.block, work: 'f'.repeat(16) } }),
+      JSON.stringify({ ...accepted, block: unsignedBlock }),
+    ]
+    for (const conflict of conflicts) {
+      const response = await postBody(floor, conflict)
+      expect(response.status).toBe(409)
+      expect((await response.json()) as { error: string }).toMatchObject({
+        error: expect.stringMatching(/envelope differs/i),
+      })
+    }
+
     // Nineteen re-encodings is more than the sixteen-event replay bound. If any
     // of them had bought a canonical slot the log would be full, the tail would
     // have compacted, and the honest write below would be refused instead.
+    expect(eventRows(storage)).toEqual(rowsBefore)
+    expect(storage.values.get('meta:event-sequence:v1')).toBe(sequenceBefore)
+
+    // A cold replay retains the same exact-envelope contract.
+    const reopened = openFloor(storage, { CARPET_NETWORK: 'mock', CARPET_LOG_MODE: 'compact' })
+    const replayed = await postBody(reopened, copies[0]!)
+    expect(replayed.status).toBe(200)
+    expect(await replayed.json()).toEqual(hash)
     expect(eventRows(storage)).toEqual(rowsBefore)
     expect(storage.values.get('meta:event-sequence:v1')).toBe(sequenceBefore)
     expect(

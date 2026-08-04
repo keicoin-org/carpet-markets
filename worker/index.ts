@@ -26,12 +26,18 @@ import {
   eventKey,
   loadLog,
   logSize,
+  measureRawUsage,
+  processBlockIdentity,
   processInputIdentity,
+  rawLimitError,
   readBoundedText,
+  reclaimCoveredRows,
   replayLimitError,
   writeCheckpoint,
   type CheckpointManifest,
   type EventInput,
+  type LoadedLog,
+  type LogUsage,
   type StoredEvent,
 } from './durable-log.js'
 
@@ -67,6 +73,9 @@ export class Floor extends DurableObject<Env> {
   #replaying = true
   #authorityBlocked: ReplayLimitError | undefined
   #compactionBlocked: ReplayLimitError | undefined
+  #acceptanceBlocked: ReplayLimitError | undefined
+  /** Persisted `event:v1:*` rows and bytes, measured from storage. */
+  #rawUsage: LogUsage = { events: 0, bytes: 0 }
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
@@ -181,6 +190,7 @@ export class Floor extends DurableObject<Env> {
         ? this.#history.filter((event) => event.sequence > this.#checkpoint!.throughSequence).length
         : this.#history.length
       this.#authorityBlocked = replayLimitError(canonicalEvents(this.#history))
+      this.#rawUsage = await measureRawUsage(this.ctx.storage)
       this.#replaying = false
       const replayMs = Date.now() - bootStarted
       this.#observe('replay', {
@@ -191,10 +201,15 @@ export class Floor extends DurableObject<Env> {
         admissionBlocked: this.#authorityBlocked?.message ?? null,
         ...this.#measure(),
       })
+      // Cleanup is the one compaction step that can fail after its pointer is
+      // already authoritative, and the next boot cannot tell that object from a
+      // healthy one. Finishing it here, before anything is admitted, is what
+      // makes a transient failure transient. It writes nothing.
+      await this.#reclaimCovered(loaded)
       // The explicit phase-2 configuration can migrate an oversized raw v1 log
       // whose canonical accepted authority is still inside the measured bound.
       // Compatibility mode never reaches this write/delete path.
-      await this.#compactIfNeeded()
+      await this.#compactAndReclaim()
       return state
     })()
     return this.#booting
@@ -305,8 +320,18 @@ export class Floor extends DurableObject<Env> {
     if (this.env.CARPET_LOG_MODE === 'compact') {
       const refusal = replayLimitError(canonicalEvents([...this.#history, projected]))
       if (refusal) return { refusal }
+      // Then what this object is really holding. Replay folds duplicates and
+      // drops every row an activated checkpoint covers, so canonical history
+      // cannot see the rows a failed cleanup left behind. Storage can, and it
+      // is the only measure that survives eviction with them.
+      this.#rawUsage = await measureRawUsage(this.ctx.storage)
+      const rawRefusal = rawLimitError({
+        events: this.#rawUsage.events + 1,
+        bytes: this.#rawUsage.bytes + eventBytes(projected),
+      })
+      if (rawRefusal) return { refusal: rawRefusal }
     }
-    return this.ctx.storage.transaction(async (storage) => {
+    const stored = await this.ctx.storage.transaction(async (storage) => {
       const sequence = (await storage.get<number>(NEXT_SEQUENCE)) ?? 0
       const event = { version: 1 as const, sequence, status: 'pending' as const, ...input } as StoredEvent
       const key = eventKey(sequence)
@@ -315,6 +340,11 @@ export class Floor extends DurableObject<Env> {
       await storage.put({ [key]: event, [NEXT_SEQUENCE]: sequence + 1 })
       return { key, event }
     })
+    this.#rawUsage = {
+      events: this.#rawUsage.events + 1,
+      bytes: this.#rawUsage.bytes + eventBytes(stored.event),
+    }
+    return stored
   }
 
   async #accept(event: StoredEvent): Promise<void> {
@@ -323,6 +353,13 @@ export class Floor extends DurableObject<Env> {
     this.#history.push(accepted)
     this.#authorityBlocked = replayLimitError(canonicalEvents(this.#history))
     this.#tailEvents += 1
+    // The row was counted when it was written; accepting it only rewrites the
+    // status in place. Replay re-measures from storage, so its accounting here
+    // is discarded rather than doubled.
+    this.#rawUsage = {
+      events: this.#rawUsage.events,
+      bytes: this.#rawUsage.bytes + eventBytes(accepted) - eventBytes(event),
+    }
     const bytes = eventBytes(accepted)
     const now = Date.now()
     this.#acceptedWindow.push({ at: now, bytes })
@@ -333,16 +370,51 @@ export class Floor extends DurableObject<Env> {
       acceptedBytesLastMinute: this.#acceptedWindow.reduce((total, entry) => total + entry.bytes, 0),
       storageOperations: 2,
       storageKeyWrites: 3,
+      // Compact-mode admission reads the persisted v1 prefix once before it
+      // allocates anything, so raw pressure is storage's answer, not memory's.
+      admissionListReads: this.env.CARPET_LOG_MODE === 'compact' ? 1 : 0,
       ...this.#measure(),
     })
-    if (!this.#replaying) await this.#compactIfNeeded()
+    if (!this.#replaying) await this.#compactAndReclaim()
   }
 
-  async #compactIfNeeded(): Promise<void> {
-    if (this.env.CARPET_LOG_MODE !== 'compact' || this.#tailEvents < LOG_LIMITS.compactAfter) return
+  /**
+   * Compact, then the single further pass a first generation can need.
+   *
+   * The first generation deliberately retains the complete v1 log, so only its
+   * verified successor authorises deleting those rows: an oversized legacy log
+   * reclaims on the second generation, never the first. A refused or failed
+   * compaction returns false and stops there — this is one extra pass, not a
+   * retry, and never a loop.
+   */
+  async #compactAndReclaim(): Promise<void> {
+    if (!(await this.#compactIfNeeded())) return
+    if (this.#rawPressure()) await this.#compactIfNeeded()
+  }
+
+  /**
+   * Whether the persisted v1 rows still leave room for another accepted row.
+   *
+   * Measured with one maximum-size input of headroom, so compaction reclaims
+   * before the raw bound has to refuse anything an operator would call
+   * ordinary. Compaction is what reclaims; the bound is what holds when it
+   * cannot.
+   */
+  #rawPressure(): boolean {
+    return (
+      rawLimitError({
+        events: this.#rawUsage.events + 1,
+        bytes: this.#rawUsage.bytes + LOG_LIMITS.requestBytes,
+      }) !== undefined
+    )
+  }
+
+  async #compactIfNeeded(): Promise<boolean> {
+    if (this.env.CARPET_LOG_MODE !== 'compact' || this.#compactionBlocked) return false
+    if (this.#tailEvents < LOG_LIMITS.compactAfter && !this.#rawPressure()) return false
     if (this.#authorityBlocked) {
       this.#observe('activation-refused', { error: this.#authorityBlocked.message, ...this.#measure() })
-      return
+      return false
     }
     const before = this.#measure()
     const started = Date.now()
@@ -350,8 +422,8 @@ export class Floor extends DurableObject<Env> {
       this.#checkpoint = await writeCheckpoint(this.ctx.storage, this.#history, this.#checkpoint)
       this.#history = canonicalEvents(this.#history)
       this.#tailEvents = 0
+      this.#rawUsage = await measureRawUsage(this.ctx.storage)
       this.#authorityBlocked = undefined
-      this.#compactionBlocked = undefined
       this.#observe('compaction', {
         ok: true,
         compactionMs: Date.now() - started,
@@ -359,7 +431,14 @@ export class Floor extends DurableObject<Env> {
         before,
         after: this.#measure(),
       })
+      return true
     } catch (error) {
+      try {
+        this.#rawUsage = await measureRawUsage(this.ctx.storage)
+      } catch {
+        // Preserve the last known conservative value; the failure record below
+        // still says compaction did not complete and admission stays closed.
+      }
       this.#compactionBlocked = new ReplayLimitError(
         `The mock market could not compact its durable replay tail: ${
           error instanceof Error ? error.message : String(error)
@@ -371,13 +450,55 @@ export class Floor extends DurableObject<Env> {
         before,
         error: error instanceof Error ? error.message : String(error),
       })
+      return false
+    }
+  }
+
+  /**
+   * Retry the cleanup an already-activated checkpoint authorises, once, at boot.
+   *
+   * Only when this boot replayed from the active generation itself: if it fell
+   * back to the predecessor or to the legacy log, those v1 rows are the
+   * authority being read and nothing may delete them. A failure fails closed
+   * rather than growing, and no new generation is written on top of rows the
+   * object has just proved it cannot remove.
+   */
+  async #reclaimCovered(loaded: LoadedLog): Promise<void> {
+    if (this.env.CARPET_LOG_MODE !== 'compact') return
+    if (!loaded.checkpoint || loaded.recoveredFrom) return
+    const started = Date.now()
+    try {
+      const outcome = await reclaimCoveredRows(this.ctx.storage)
+      this.#rawUsage = await measureRawUsage(this.ctx.storage)
+      this.#observe('reclaim', {
+        ok: true,
+        outcome,
+        reclaimMs: Date.now() - started,
+        ...this.#measure(),
+      })
+    } catch (error) {
+      try {
+        this.#rawUsage = await measureRawUsage(this.ctx.storage)
+      } catch {
+        // Preserve the last known value while the durable failure stays latched.
+      }
+      this.#compactionBlocked = new ReplayLimitError(
+        `The mock market could not reclaim the durable rows its active checkpoint already covers: ${
+          error instanceof Error ? error.message : String(error)
+        }. No further ledger mutation was accepted; preserve the named Durable Object and repair storage cleanup before retrying.`,
+      )
+      this.#observe('reclaim', {
+        ok: false,
+        reclaimMs: Date.now() - started,
+        error: error instanceof Error ? error.message : String(error),
+        ...this.#measure(),
+      })
     }
   }
 
   #measure(): Record<string, unknown> {
     const authority = canonicalEvents(this.#history)
     const size = logSize(authority)
-    const raw = logSize(this.#history)
     const byKind: Record<string, { events: number; bytes: number }> = {}
     for (const event of authority) {
       const current = byKind[event.kind] ?? { events: 0, bytes: 0 }
@@ -388,11 +509,22 @@ export class Floor extends DurableObject<Env> {
     return {
       events: size.events,
       bytes: size.bytes,
-      rawEvents: raw.events,
-      rawBytes: raw.bytes,
+      // Persisted `event:v1:*`, measured from storage rather than inferred from
+      // replay. In-memory history is the checkpoint plus its tail, so it cannot
+      // describe migration cost or the rows a failed cleanup is still holding.
+      rawEvents: this.#rawUsage.events,
+      rawBytes: this.#rawUsage.bytes,
       tailEvents: this.#tailEvents,
       limits: LOG_LIMITS,
       byKind,
+    }
+  }
+
+  /** A rejected mutation's WAL row is deleted, so it stops counting as stored. */
+  #discardRaw(event: StoredEvent): void {
+    this.#rawUsage = {
+      events: this.#rawUsage.events - 1,
+      bytes: this.#rawUsage.bytes - eventBytes(event),
     }
   }
 
@@ -405,8 +537,9 @@ export class Floor extends DurableObject<Env> {
     state: { registry: Registry; chain: ChainSource },
   ): Promise<Response> {
     return this.#mutations.run(async () => {
-      const retry = acceptedProcessRetry(input, this.#history)
-      if (retry) {
+      const process = acceptedProcessMatch(input, this.#history)
+      if (process?.kind === 'retry') {
+        const retry = process.event
         try {
           const response = await this.#apply(retry, state)
           this.#observe('idempotent-retry', {
@@ -418,9 +551,26 @@ export class Floor extends DurableObject<Env> {
           this.#now = Date.now()
         }
       }
+      if (process?.kind === 'conflict') {
+        return json(
+          {
+            error:
+              'That block body is already accepted, but this work/signature envelope differs from the accepted request. Resend the same complete signed block; no durable mutation was written.',
+          },
+          409,
+        )
+      }
       if (this.env.CARPET_LOG_MODE === 'compact') {
         const blocked = this.#compactionBlocked ?? this.#authorityBlocked
         if (blocked) return json({ error: blocked.message }, blocked.status)
+      }
+      // Application precedes the pending -> accepted storage rewrite. If that
+      // rewrite failed, this live instance has already applied authority that a
+      // same-instance retry could apply twice. Reads and exact accepted process
+      // retries remain safe, but all new mutations wait for cold replay to
+      // reconcile the retained pending row.
+      if (this.#acceptanceBlocked) {
+        return json({ error: this.#acceptanceBlocked.message }, this.#acceptanceBlocked.status)
       }
       // Write-ahead is what makes a crash between receipt and application safe.
       // Failed mock blocks are atomic in MockLedger; quote/reply validation runs
@@ -429,16 +579,39 @@ export class Floor extends DurableObject<Env> {
       const stored = await this.#append(input)
       if ('refusal' in stored) return json({ error: stored.refusal.message }, stored.refusal.status)
       try {
-        const response = await this.#apply(stored.event, state)
-        if (response instanceof Response && (await responseFailure(response))) {
+        let response: Response | unknown
+        try {
+          response = await this.#apply(stored.event, state)
+        } catch (error) {
+          // Every application exception is raised before the corresponding mock
+          // ledger/thread mutation commits. Only that proven-atomic failure may
+          // remove its WAL row.
           await this.ctx.storage.delete(stored.key)
-        } else {
+          this.#discardRaw(stored.event)
+          throw error
+        }
+        if (response instanceof Response && (await responseFailure(response))) {
+          // MockLedger returns its rejected response atomically, before mutation.
+          await this.ctx.storage.delete(stored.key)
+          this.#discardRaw(stored.event)
+          return response
+        }
+        try {
           await this.#accept(stored.event)
+        } catch (error) {
+          // Application succeeded. The pending WAL is now the sole durable path
+          // that lets a fresh instance reproduce and accept this mutation once.
+          // Never delete it, and never let this already-mutated instance apply a
+          // retry or any later mutation on top of unresolved authority.
+          this.#acceptanceBlocked = new ReplayLimitError(
+            `The mock market applied a mutation but could not mark its durable WAL row accepted: ${
+              error instanceof Error ? error.message : String(error)
+            }. The pending row was preserved; retry after a cold restart can recover it exactly once.`,
+            503,
+          )
+          return json({ error: this.#acceptanceBlocked.message }, this.#acceptanceBlocked.status)
         }
         return response instanceof Response ? response : json(response)
-      } catch (error) {
-        await this.ctx.storage.delete(stored.key)
-        throw error
       } finally {
         this.#now = Date.now()
       }
@@ -492,19 +665,27 @@ class Queue {
   }
 }
 
-function acceptedProcessRetry(
+function acceptedProcessMatch(
   input: EventInput,
   history: readonly StoredEvent[],
-): StoredEvent | undefined {
+): { kind: 'retry'; event: StoredEvent } | { kind: 'conflict' } | undefined {
   if (input.kind !== 'rpc') return undefined
-  const identity = processInputIdentity(input.body)
-  if (identity === undefined) return undefined
-  return history.find(
-    (event) =>
-      event.status === 'accepted' &&
-      event.kind === 'rpc' &&
-      processInputIdentity(event.body) === identity,
-  )
+  const blockIdentity = processBlockIdentity(input.body)
+  if (blockIdentity === undefined) return undefined
+  const envelopeIdentity = processInputIdentity(input.body)
+  let conflict = false
+  for (const event of history) {
+    if (event.status !== 'accepted' || event.kind !== 'rpc') continue
+    if (processBlockIdentity(event.body) !== blockIdentity) continue
+    if (
+      envelopeIdentity !== undefined &&
+      processInputIdentity(event.body) === envelopeIdentity
+    ) {
+      return { kind: 'retry', event }
+    }
+    conflict = true
+  }
+  return conflict ? { kind: 'conflict' } : undefined
 }
 
 export default {
