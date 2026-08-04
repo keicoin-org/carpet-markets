@@ -364,3 +364,9 @@ test('a caveat with no section cites none rather than inventing one', () => {
   expect(view.text()).not.toContain('SPEC §')
   view.unmount()
 })
+
+test('the DOM harness gives server tests their plain runtime back', () => {
+  const view = render(<span>temporary browser</span>)
+  view.unmount()
+  expect('document' in globalThis).toBe(false)
+})

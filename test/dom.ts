@@ -25,6 +25,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import type { ReactElement } from 'react'
 
 let registered = false
+let activeViews = 0
 
 /** Install `window`, `document` and friends. Idempotent. */
 export function useDom(): void {
@@ -53,6 +54,7 @@ export interface Rendered {
 /** Render a tree, flush its effects, and hand back a few ways to look at it. */
 export function render(element: ReactElement): Rendered {
   useDom()
+  activeViews += 1
   const container = document.createElement('div')
   document.body.append(container)
 
@@ -62,6 +64,7 @@ export function render(element: ReactElement): Rendered {
     root.render(element)
   })
 
+  let mounted = true
   const view: Rendered = {
     container,
     text: () => (container.textContent ?? '').replace(/\s+/g, ' ').trim(),
@@ -89,8 +92,19 @@ export function render(element: ReactElement): Rendered {
       })
     },
     unmount: () => {
+      if (!mounted) return
+      mounted = false
       act(() => root.unmount())
       container.remove()
+      activeViews -= 1
+      if (activeViews === 0) {
+        registered = false
+        delete (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT
+        // unregister() removes the globals before its first await; the remaining
+        // promise only closes Happy DOM's window. Do not let one component test
+        // make a later server test look like it is running in a browser.
+        void GlobalRegistrator.unregister()
+      }
     },
   }
 
