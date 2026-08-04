@@ -29,11 +29,12 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { Offer, Trade } from 'kei-transaction'
+import type { AssetInfo, Offer, Trade } from 'kei-transaction'
 
 import type { Book, Holder, Listing, MarketFacts } from '../shared/listing'
 import type { Reply } from '../shared/social'
 import type { Funds, InFlight } from './balance'
+import { fed, FEED_OPENING, starved, type FeedState } from './feed'
 import { connect, explain, type Trader } from './market'
 import { advance, begin, fail, prune, type Tx, type TxKind } from './tx'
 
@@ -56,6 +57,14 @@ interface MarketState {
   activity: Trade[]
   /** False once the first read comes back, which is how loading is told from empty. */
   loading: boolean
+  /**
+   * Whether the chain is still answering, and how old what is on screen is.
+   *
+   * A failed poll used to be a `console.warn` and nothing else, which meant a
+   * page that had stopped reading looked exactly like a page where nothing was
+   * happening. On a market screen those are opposite facts — see `lib/feed.ts`.
+   */
+  feed: FeedState
   funds: Funds
   holdings: Map<string, number>
   mine: Offer[]
@@ -87,6 +96,7 @@ export function MarketProvider({ children }: { children: ReactNode }) {
   const [facts, setFacts] = useState<MarketFacts | null>(null)
   const [activity, setActivity] = useState<Trade[]>([])
   const [loading, setLoading] = useState(true)
+  const [feed, setFeed] = useState<FeedState>(FEED_OPENING)
   const [chain, setChain] = useState<Chain>(NO_CHAIN)
   const [inFlight, setInFlight] = useState<InFlight[]>([])
   const [holdings, setHoldings] = useState<Map<string, number>>(new Map())
@@ -157,11 +167,16 @@ export function MarketProvider({ children }: { children: ReactNode }) {
       setHoldings(held)
       setMine(open)
       setActivity(settled)
+      setFeed((current) => fed(current, Date.now()))
     } catch (error) {
       // A missed poll is not something to shout about — the next one is two
-      // seconds away and the page is still showing the last good read. Only a
-      // signature failing is worth a record, and that has one already.
-      console.warn('carpet: a read did not come back —', explain(error))
+      // seconds away and the page is still showing the last good read. What it
+      // must not be is silent: the bar carries the age of what is on screen, so
+      // a feed that has stopped is visible rather than inferred from figures
+      // that have simply stopped moving.
+      const why = explain(error)
+      console.warn('carpet: a read did not come back —', why)
+      setFeed((current) => starved(current, why))
     } finally {
       setLoading(false)
     }
@@ -272,6 +287,7 @@ export function MarketProvider({ children }: { children: ReactNode }) {
       facts,
       activity,
       loading,
+      feed,
       funds,
       holdings,
       mine,
@@ -282,9 +298,24 @@ export function MarketProvider({ children }: { children: ReactNode }) {
       dismiss,
       refresh,
     }),
-    [trader, fatal, facts, activity, loading, funds, holdings, mine, busy, log, act, retry, dismiss, refresh],
+    [trader, fatal, facts, activity, loading, feed, funds, holdings, mine, busy, log, act, retry, dismiss, refresh],
   )
 
+  return <MarketStateProvider value={value}>{children}</MarketStateProvider>
+}
+
+/**
+ * The context, separated from the thing that opens a wallet to fill it.
+ *
+ * `MarketProvider` derives a real market state from a real chain, which is what
+ * the app wants and exactly what a test of a panel does not: rendering one
+ * would open a wallet, poll a node, and make the assertion depend on a network.
+ * Splitting the two means a test can hand a panel the state it is meant to
+ * render and assert what appears — which is how the sentences in `lib/refusals`
+ * and the absences in `lib/metrics` are checked on screen rather than in
+ * isolation (SPEC §9.6, criteria 2 and 4).
+ */
+export function MarketStateProvider({ value, children }: { value: MarketState; children: ReactNode }) {
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>
 }
 
@@ -308,6 +339,55 @@ export function useMyOffers(asset: string | null): { offers: Offer[]; locked: nu
     const offers = asset ? mine.filter((offer) => offer.give.asset === asset) : []
     return { offers, locked: offers.reduce((total, offer) => total + offer.give.amount, 0) }
   }, [mine, asset])
+}
+
+export interface AssetInfoState {
+  /** What the node said, or null until it has said it. */
+  info: AssetInfo | null
+  loading: boolean
+  /** Set when the node could not be asked. Distinct from "no such asset". */
+  problem: string | null
+}
+
+/**
+ * What the ledger itself says about a coin, read once, in this browser.
+ *
+ * Deliberately not on the two-second poll. An asset record is written at
+ * issuance and is immutable afterwards (SPEC §5.4, §5.6.1) — re-reading it every
+ * two seconds would be asking a question whose answer cannot change, on every
+ * open tab, forever. It is read when a coin page opens and kept.
+ */
+export function useAssetInfo(asset: string | null): AssetInfoState {
+  const { trader } = useMarket()
+  const [info, setInfo] = useState<AssetInfo | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [problem, setProblem] = useState<string | null>(null)
+
+  useEffect(() => {
+    setInfo(null)
+    setProblem(null)
+    setLoading(true)
+    if (!trader || !asset) return
+
+    let live = true
+    void trader.assetInfo(asset).then(
+      (next) => {
+        if (!live) return
+        setInfo(next)
+        setLoading(false)
+      },
+      (error: unknown) => {
+        if (!live) return
+        setProblem(explain(error))
+        setLoading(false)
+      },
+    )
+    return () => {
+      live = false
+    }
+  }, [trader, asset])
+
+  return { info, loading, problem }
 }
 
 interface CoinState {

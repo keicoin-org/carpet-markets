@@ -27,6 +27,18 @@
    */
   --color-fainter: #7a8794;
 
+  /**
+   * The edge of anything you can type in.
+   *
+   * `line` is 1.25:1 against `panel` and 1.35:1 against `floor`, which is right
+   * for a rule between two rows of a dense table and wrong for the boundary of a
+   * control — WCAG 1.4.11 wants 3:1 for the thing that tells you a control is
+   * there, and a text field whose fill is 1.08:1 against its container has
+   * nothing else to say it with. This clears 3:1 on floor, panel and raised, and
+   * is used only on inputs and textareas so the board's rules stay quiet.
+   */
+  --color-field: #4d5862;
+
   --color-gold: #e3b341;
   --color-gold-deep: #16130a;
   --color-up: #6ee787;
@@ -71,7 +83,36 @@
   :focus-visible {
     outline: 2px solid var(--color-gold);
     outline-offset: 2px;
-    border-radius: 2px;
+  }
+
+  /**
+   * The ring drawn inside the element instead of around it.
+   *
+   * A tab strip sits flush against the top edge of a `panel overflow-hidden`,
+   * so an outset ring loses its top edge to the clip. Three sides is still a
+   * visible indicator and it is still a degraded one; drawing it inward keeps
+   * all four. Applied by the tab strips themselves rather than globally,
+   * because everywhere else the offset is what separates the ring from the
+   * control.
+   */
+  .focus-inset:focus-visible {
+    outline-offset: -2px;
+  }
+
+  /**
+   * Room for the sticky bar above anything scrolled into view.
+   *
+   * The header is `sticky top-0` and about 4rem tall, so a fragment jump — the
+   * skip link, or the policy badge's `#ledger` — and a Tab that scrolls a
+   * control into view both land underneath it. WCAG 2.4.11 asks that the
+   * focused element not be obscured; this is the whole fix.
+   */
+  html {
+    scroll-padding-top: 4.5rem;
+  }
+
+  [id] {
+    scroll-margin-top: 4.5rem;
   }
 
   /* Dark, thin, and out of the way — the board is dense enough. */
@@ -104,6 +145,17 @@
 
   .panel {
     @apply rounded-lg border border-line bg-panel;
+  }
+
+  /**
+   * Anything you can type in.
+   *
+   * One class so the boundary that has to clear 3:1 is stated once. The size and
+   * the font stay at the call site, because a price field and a search box want
+   * different ones and neither is a contrast question.
+   */
+  .field {
+    @apply rounded-md border border-field bg-floor;
   }
 
   /* Uppercase micro-labels, the way an instrument panel labels a dial. */

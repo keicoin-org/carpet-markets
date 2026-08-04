@@ -23,6 +23,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Activity } from '../components/Activity'
 import { CoinCard } from '../components/CoinCard'
 import { crown, KingOfTheHill } from '../components/KingOfTheHill'
+import { Caveat } from '../components/Caveat'
 import { arrange, DEFAULT_QUERY, FILTERS, narrowed, pulse, SORTS, type BoardQuery } from '../lib/board'
 import { useMarket } from '../lib/use-market'
 
@@ -42,8 +43,9 @@ export default function Board() {
   useEffect(() => {
     const onKey = (event: KeyboardEvent): void => {
       const target = event.target as HTMLElement | null
-      if (event.key !== '/' || event.metaKey || event.ctrlKey) return
-      if (target && /^(input|textarea)$/i.test(target.tagName)) return
+      if (event.key !== '/' || event.metaKey || event.ctrlKey || event.altKey) return
+      if (target && /^(input|textarea|select)$/i.test(target.tagName)) return
+      if (target?.isContentEditable) return
       event.preventDefault()
       search.current?.focus()
     }
@@ -70,6 +72,8 @@ export default function Board() {
 
   return (
     <div className="space-y-4">
+      <h1 className="sr-only">Coins listed on Carpet Markets</h1>
+
       {king && <KingOfTheHill listing={king} />}
 
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_18rem]">
@@ -84,9 +88,9 @@ export default function Board() {
                   value={query.text}
                   onChange={(event) => update({ text: event.target.value })}
                   placeholder="Search ticker, name, blurb, or paste an address"
-                  className="w-full rounded-md border border-line bg-panel px-3 py-2 pr-8 text-sm placeholder:text-fainter focus:border-line-bright"
+                  className="field w-full px-3 py-2 pr-8 text-sm placeholder:text-fainter"
                 />
-                <kbd className="pointer-events-none absolute right-2 top-1/2 hidden -translate-y-1/2 rounded border border-line px-1 font-mono text-[10px] text-fainter sm:block">
+                <kbd aria-hidden className="pointer-events-none absolute right-2 top-1/2 hidden -translate-y-1/2 rounded border border-line px-1 font-mono text-[10px] text-fainter sm:block">
                   /
                 </kbd>
               </label>
@@ -141,11 +145,9 @@ export default function Board() {
         </aside>
       </div>
 
-      <p className="border-t border-line pt-4 text-[11px] leading-relaxed text-fainter">
-        This is the list of coins one registry has been told about, not the network. An offer written by a wallet that
-        never announced itself is perfectly valid, settles perfectly well, and is not on this page — which is what it
-        means for a chain to ship no indexer.
-      </p>
+      <div className="border-t border-line pt-4">
+        <Caveat id="account-list" />
+      </div>
     </div>
   )
 }
@@ -159,7 +161,20 @@ function Count({ label, value, accent = false }: { label: string; value: number;
   )
 }
 
-/** A row of toggles, which is what a segmented control is when it is honest. */
+/**
+ * One choice out of several, which is what these always were.
+ *
+ * They carried `aria-pressed`, which announces N independent toggles: picking
+ * one silently un-presses another, with no "3 of 7" and no relationship between
+ * them. The launch screen already met this problem and solved it with real
+ * radios (`app/launch/page.tsx`); this is the same fix where the styling makes
+ * real inputs awkward — `radiogroup`/`radio`/`aria-checked`, one tab stop, and
+ * the arrow keys moving the selection.
+ *
+ * The hint is a `title` *and* a visually-hidden sentence, because the chip's own
+ * text is a two-word label and the hint says which field it sorts on. A tooltip
+ * alone is pointer-only.
+ */
 function Chips<T extends string>({
   label,
   options,
@@ -171,14 +186,45 @@ function Chips<T extends string>({
   active: T
   onPick: (key: T) => void
 }) {
+  const strip = useRef<HTMLDivElement>(null)
+
+  const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>): void => {
+    const at = options.findIndex((option) => option.key === active)
+    if (at < 0) return
+    const next =
+      event.key === 'ArrowRight' || event.key === 'ArrowDown'
+        ? (at + 1) % options.length
+        : event.key === 'ArrowLeft' || event.key === 'ArrowUp'
+          ? (at - 1 + options.length) % options.length
+          : event.key === 'Home'
+            ? 0
+            : event.key === 'End'
+              ? options.length - 1
+              : -1
+    if (next < 0) return
+    event.preventDefault()
+    const key = options[next]!.key
+    onPick(key)
+    strip.current?.querySelector<HTMLButtonElement>(`[data-chip="${key}"]`)?.focus()
+  }
+
   return (
-    <div className="flex flex-wrap items-center gap-1" role="group" aria-label={label}>
+    <div
+      ref={strip}
+      className="flex flex-wrap items-center gap-1"
+      role="radiogroup"
+      aria-label={label}
+      onKeyDown={onKeyDown}
+    >
       {options.map((option) => (
         <button
           key={option.key}
           type="button"
+          role="radio"
+          data-chip={option.key}
           title={option.hint}
-          aria-pressed={active === option.key}
+          aria-checked={active === option.key}
+          tabIndex={active === option.key ? 0 : -1}
           onClick={() => onPick(option.key)}
           className={`rounded border px-2 py-1 font-mono text-[10px] uppercase tracking-[0.08em] transition-colors ${
             active === option.key
@@ -187,6 +233,7 @@ function Chips<T extends string>({
           }`}
         >
           {option.label}
+          <span className="sr-only"> — {option.hint}</span>
         </button>
       ))}
     </div>
@@ -201,7 +248,8 @@ function Chips<T extends string>({
  */
 function Skeleton() {
   return (
-    <div className="space-y-3" role="status" aria-label="Loading the board">
+    <div className="space-y-3" role="status">
+      <span className="sr-only">Reading the board.</span>
       <div className="panel h-32 animate-pulse motion-reduce:animate-none" />
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_18rem]">
         <div className="grid gap-2.5 sm:grid-cols-2 xl:grid-cols-3">
@@ -240,9 +288,9 @@ function Empty({ listed, narrowed, onClear }: { listed: number; narrowed: boolea
       <p className="text-sm text-ink">Nothing is listed yet.</p>
       <p className="mx-auto mt-2 max-w-md text-xs leading-relaxed text-fainter">
         Launching costs a little over one Kei, almost all of which is burned rather than collected — and the faucet in
-        the bar above hands out twenty-five. On the mock chain the ledger lives in memory, so an empty board usually
-        means it restarted rather than that nobody has been here.
+        the bar above hands out twenty-five.
       </p>
+      <Caveat id="ephemeral-ledger" className="mx-auto mt-3 max-w-md text-left" />
     </div>
   )
 }

@@ -128,7 +128,7 @@ export function PriceChart({ trades, asset }: { trades: readonly Trade[]; asset:
 
   return (
     <div className="relative h-52 w-full overflow-hidden rounded-md border border-line bg-floor">
-      <canvas ref={canvasRef} className="block h-52 w-full" />
+      <canvas ref={canvasRef} aria-hidden className="block h-52 w-full" />
 
       {trades.length === 0 ? (
         <p className="absolute inset-0 grid place-items-center px-6 text-center text-sm text-fainter">

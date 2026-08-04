@@ -31,7 +31,7 @@ export function SupplyMeter({ listing, compact = false }: { listing: Listing; co
         <span className="eyebrow">Creator still holds</span>
         <span className="font-mono text-sm tabular">{label}%</span>
       </div>
-      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-line">
+      <div aria-hidden className="mt-2 h-1.5 overflow-hidden rounded-full bg-line">
         <div className="h-full rounded-full bg-gold transition-[width] duration-500" style={{ width: `${percent}%` }} />
       </div>
       {!compact && (

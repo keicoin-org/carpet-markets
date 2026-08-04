@@ -8,7 +8,13 @@ import { MarketProvider } from '../lib/use-market'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'Carpet Markets — launch a coin on Kei',
+  // A template rather than one string, because four screens sharing one title
+  // is four screens a client-side navigation cannot announce (WCAG 2.4.2). Each
+  // route sets its own; the board keeps the default.
+  title: {
+    default: 'Carpet Markets — launch a coin on Kei',
+    template: '%s — Carpet Markets',
+  },
   description:
     'A coin launchpad where the difference between a rug and a real one is a transfer policy the chain enforces. A Kei example. Nothing here is worth anything.',
   icons: { icon: './favicon.ico' },
@@ -30,7 +36,14 @@ export default function RootLayout({ children }: { children: ReactNode }) {
 
         <MarketProvider>
           <Header />
-          <main id="board" className="mx-auto w-full max-w-7xl flex-1 px-3 py-4 sm:px-4 sm:py-5">
+          {/* `tabIndex={-1}` so the skip link moves focus rather than only
+              scrolling — without it Safari jumps the viewport and the next Tab
+              restarts from the top of the document. */}
+          <main
+            id="board"
+            tabIndex={-1}
+            className="mx-auto w-full max-w-7xl flex-1 px-3 py-4 outline-none sm:px-4 sm:py-5"
+          >
             {children}
           </main>
 

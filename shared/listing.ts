@@ -165,6 +165,21 @@ export interface MarketFacts {
    * and second burn, and never anybody else's.
    */
   launchFee: string
+  /**
+   * What the fee is made of, from the constants that charge it.
+   *
+   * The launch screen used to print "1 Kei" and "0.1 Kei" as literal strings
+   * beside a total it computed, so the breakdown was a caption rather than a
+   * statement — it would have kept saying 1 Kei if `issuanceBurn` ever answered
+   * something else, and nothing would have failed. These are the same two
+   * bigints the registry actually sends, serialised.
+   */
+  launchFeeParts: {
+    /** The burn, which is destroyed rather than collected (SPEC §5.6.5). */
+    burn: string
+    /** Left on the new issuing account so it can still sign after paying it. */
+    margin: string
+  }
   listings: Listing[]
 }
 

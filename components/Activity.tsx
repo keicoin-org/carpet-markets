@@ -68,6 +68,7 @@ export function Activity({
                   className="flex items-baseline gap-2 rounded px-1 py-0.5 font-mono text-[11px] tabular hover:bg-raised"
                 >
                   <span className={`w-16 shrink-0 truncate font-semibold ${mine ? 'text-gold' : 'text-ink'}`}>
+                    {mine && <span className="sr-only">Your trade. </span>}
                     {listing.symbol}
                   </span>
                   <span className="shrink-0 text-dim">{formatCoins(coins)}</span>
