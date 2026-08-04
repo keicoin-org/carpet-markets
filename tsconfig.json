@@ -57,6 +57,7 @@
     "node_modules",
     "out",
     ".next",
-    "dist"
+    "dist",
+    "test/worker-runtime"
   ]
 }

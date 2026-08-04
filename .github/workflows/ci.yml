@@ -26,8 +26,14 @@ jobs:
       - name: typecheck the worker against Cloudflare's globals
         run: bun run typecheck:worker
 
+      - name: typecheck the Workers-runtime persistence proof
+        run: bun run typecheck:worker-test
+
       - name: test
         run: bun test
+
+      - name: prove Durable Object persistence in the Workers runtime
+        run: bun run test:workers
 
       - name: the client still exports to static files
         run: bun run build:site

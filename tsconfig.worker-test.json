@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.worker.json",
+  "compilerOptions": {
+    "types": [
+      "@cloudflare/workers-types",
+      "@cloudflare/vitest-pool-workers/types"
+    ],
+    "incremental": false
+  },
+  "include": [
+    "worker",
+    "test/worker-runtime"
+  ]
+}
