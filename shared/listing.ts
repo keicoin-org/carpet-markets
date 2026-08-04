@@ -15,6 +15,8 @@
 
 import type { Offer, PriceSummary, Trade } from 'kei-transaction'
 
+import type { NetworkFacts } from './network.js'
+
 /**
  * Who may move a coin's units, chosen at issuance and immutable after
  * (SPEC §5.4). This is the whole argument of this example.
@@ -97,6 +99,18 @@ export interface ListingStats {
   holders: number
   replies: number
   /**
+   * Open offers somebody could accept this second.
+   *
+   * On the board rather than one click in, because "is anybody selling" is a
+   * different question from "has anybody sold" and a launchpad that only answers
+   * the second sends people to a page with an empty book. It is also the honest
+   * asymmetry of a market with no market maker: there is always something to
+   * sell into a curve and there is not always somebody to buy from here.
+   */
+  asks: number
+  /** The cheapest open ask, in Kei per unit. Null when nobody is selling. */
+  bestAsk: number | null
+  /**
    * Whole units the launcher is still sitting on.
    *
    * The single most predictive number on the board and the reason it is computed
@@ -133,7 +147,15 @@ export interface Holder {
 export interface MarketFacts {
   /** The registry's own address. Launch fees go here; nothing else does. */
   address: string
-  network: string
+  /**
+   * Which chain is underneath, reported rather than compiled in.
+   *
+   * The client renders this in the bar and on the network panel, and it is the
+   * one fact on the page that must never be guessed: a badge derived from a
+   * build-time constant would still say "mock" the first time somebody served
+   * the same bundle against a real node. See `shared/network.ts`.
+   */
+  chain: NetworkFacts
   /**
    * Raw Kei a launch costs, as a decimal string.
    *
@@ -154,6 +176,49 @@ export interface LaunchQuote {
   to: string
   /** Decimal Kei. Pay at least this; change comes back. */
   fee: string
+}
+
+// ------------------------------------------------------------- reading an offer
+
+/** The two amounts in an offer, whichever way up it was written. */
+interface TwoSided {
+  give: { asset: string; amount: number }
+  want: { asset: string; amount: number }
+  price: number
+}
+
+/**
+ * Kei per one unit of a coin, whichever leg the coin is on.
+ *
+ * `Offer.price` is `want.amount` per one unit of `give`, which is the price
+ * everybody means on an ask — the seller gives coins and wants Kei. On a **bid**
+ * the legs are the other way up: the bidder gives Kei and wants coins, so the
+ * SDK's `price` is *coins per Kei*, and rendering it in a column headed "each"
+ * puts 3,333 next to 0.0003 and reads as a coin worth three thousand times its
+ * asking price.
+ *
+ * This is the single place that inversion is undone. Every ladder row, spread,
+ * card figure, sort and history line goes through it, because the one thing
+ * worse than an inverted price is two of them disagreeing.
+ *
+ * Note that `PriceSummary` from the SDK needs no correction — `summarise` already
+ * normalises both directions. It is the raw `price` on an `Offer` or a `Trade`
+ * that is direction-dependent.
+ */
+export function unitPrice(offer: TwoSided, asset: string): number {
+  if (offer.give.asset === asset) return offer.price
+  if (offer.want.amount <= 0) return 0
+  return offer.give.amount / offer.want.amount
+}
+
+/** Units of the coin in an offer, on whichever leg it sits. */
+export function coinAmount(offer: TwoSided, asset: string): number {
+  return offer.give.asset === asset ? offer.give.amount : offer.want.amount
+}
+
+/** The Kei leg: what a buyer hands over on an ask, what a seller collects on a bid. */
+export function keiAmount(offer: TwoSided, asset: string): number {
+  return offer.give.asset === asset ? offer.want.amount : offer.give.amount
 }
 
 // ------------------------------------------------------------------ validation

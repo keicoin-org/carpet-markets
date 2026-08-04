@@ -38,11 +38,13 @@ import {
 } from 'kei-transaction'
 
 import { formatKei, KEI_RAW } from '../shared/format.js'
+import type { NetworkFacts } from '../shared/network.js'
 import {
   cleanIdentity,
   cleanTransfer,
   LAUNCH_SUPPLY,
   ListingError,
+  unitPrice,
   type Book,
   type Holder,
   type LaunchQuote,
@@ -56,6 +58,14 @@ export interface RegistryOptions {
   seed: string
   node: KeiNode | string
   network?: NetworkName
+  /**
+   * What to tell the client about the chain underneath.
+   *
+   * Passed in rather than inferred from `network`, because the SDK's name for a
+   * network and the sentence a visitor needs are different things — "mock" is
+   * accurate and says nothing about whether the coins survive a restart.
+   */
+  chain?: NetworkFacts
   /** How long a quote waits for its payment before it is forgotten. */
   intentTtlMs?: number
   /**
@@ -79,6 +89,8 @@ export interface Registry {
   book(asset: string): Promise<Book>
   /** Who holds it, of the accounts this registry knows to ask about. */
   holders(asset: string): Promise<Holder[]>
+  /** Settled trades across every listed coin, newest first. */
+  activity(limit?: number): Promise<Trade[]>
   /**
    * Tell the registry an address is worth reading.
    *
@@ -99,6 +111,20 @@ const DEFAULT_INTENT_TTL_MS = 120_000
 
 /** How long a coin's card numbers are reused before they are read again. */
 const SUMMARY_TTL_MS = 4_000
+
+/** How deep the cross-coin ticker reads. Beyond this nobody is scrolling. */
+const ACTIVITY_MAX = 60
+
+/** A coin nothing could be read about, which is not the same as a quiet one. */
+const NO_STATS = (supply: number): ListingStats => ({
+  last: null,
+  trades: 0,
+  holders: 0,
+  replies: 0,
+  asks: 0,
+  bestAsk: null,
+  creatorHolds: supply,
+})
 
 /**
  * What a launch costs, and why it is a constant.
@@ -167,6 +193,7 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
   const coins = new Map<string, Coin>()
   const intents = new Map<string, Intent>()
   const summaries = new Map<string, { at: number; stats: ListingStats }>()
+  let activityCache: { at: number; trades: Trade[] } | undefined
   /**
    * Every account whose chain might carry an offer.
    *
@@ -175,7 +202,7 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
    * exists, and it is the one piece of state that is not on the chain.
    */
   const traders = new Set<string>([kei.address])
-  /** The next seed index to derive an issuer at. 0 is the registry itself. */
+  /** Where to start looking for an unused issuer index. 0 is the registry itself. */
   let nextIndex = 1
   const writes = new Queue()
 
@@ -183,13 +210,57 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
   // empty balance cannot fund the first issuer it derives, and on a real network
   // somebody funds this address once instead. A faucet that is not there is not
   // an error.
-  if ((await rawBalance(kei.address)) < WORKING_CAPITAL_RAW) {
-    await kei.faucet(formatKei(WORKING_CAPITAL_RAW, 18)).catch(() => undefined)
-  }
+  await topUp()
 
   async function rawBalance(address: string): Promise<bigint> {
     const info = await kei.client.node.accountInfo(address)
     return info ? BigInt(info.balance) : 0n
+  }
+
+  /**
+   * An account from this seed that has never issued anything.
+   *
+   * The flat launch fee is only correct if every coin is the *first* asset its
+   * issuing account creates, because the burn escalates per account (SPEC
+   * §5.6.5). On a mock chain a counter is enough: the ledger is new every boot,
+   * so index 1 is always untouched. On a real network it is not — the chain
+   * outlives the process, so a restart with the same seed walks straight back
+   * over accounts that have already issued, and the second coin at index 1 would
+   * quietly cost 2 Kei against a quote of 1.
+   *
+   * So the index is a starting point and the chain is the authority: an account
+   * with no blocks on it has issued nothing. The scan costs one `account_info`
+   * per skipped index, once, and only on a network where there is anything to
+   * skip.
+   */
+  async function freshIssuer(): Promise<Kei> {
+    for (;;) {
+      const index = nextIndex++
+      const candidate = await Kei.server({
+        seed: options.seed,
+        index,
+        node: options.node,
+        ...(options.network === undefined ? {} : { network: options.network }),
+      })
+      if ((await kei.client.node.accountInfo(candidate.address)) === null) return candidate
+      candidate.close()
+    }
+  }
+
+  /**
+   * Ask the faucet for more, if there is one and the balance has run down.
+   *
+   * The registry pays each new issuer its burn out of its own balance, so it
+   * runs down at roughly a Kei per launch. On the mock chain the faucet is
+   * infinite; on the testnet it is a rate-limited service that may say no, and
+   * saying no is not an error — it is the reason `quoteLaunch` still checks the
+   * balance afterwards and refuses in a sentence rather than failing mid-launch
+   * with the visitor's fee already spent.
+   */
+  async function topUp(): Promise<void> {
+    if ((await rawBalance(kei.address)) >= WORKING_CAPITAL_RAW) return
+    await kei.faucet(formatKei(WORKING_CAPITAL_RAW, 18)).catch(() => undefined)
+    await kei.sync().catch(() => undefined)
   }
 
   // ------------------------------------------------------------------ payments
@@ -222,13 +293,7 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
    * `transfer`, and the node decides it, not this file.
    */
   async function launch(creator: string, intent: Intent, paid: bigint): Promise<void> {
-    const index = nextIndex++
-    const issuer = await Kei.server({
-      seed: options.seed,
-      index,
-      node: options.node,
-      ...(options.network === undefined ? {} : { network: options.network }),
-    })
+    const issuer = await freshIssuer()
 
     // The burn comes out of the issuer's own balance, so it has to be there
     // before the issue block is signed.
@@ -290,8 +355,10 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
 
     return {
       asset,
-      asks: [...giving].sort(byPrice),
-      bids: [...wanting].sort(byPrice).reverse(),
+      // Cheapest ask first, best bid first — both in Kei per unit, which for a
+      // bid is not the number the SDK put in `price`. See `unitPrice`.
+      asks: [...giving].sort((a, b) => unitPrice(a, asset) - unitPrice(b, asset)),
+      bids: [...wanting].sort((a, b) => unitPrice(b, asset) - unitPrice(a, asset)),
       trades: [...trades].sort((a, b) => (a.settledAt ?? a.seenAt) - (b.settledAt ?? b.seenAt)),
       price,
     }
@@ -348,22 +415,57 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
     if (cached && Date.now() - cached.at < SUMMARY_TTL_MS) return cached.stats
 
     try {
-      const [price, holding] = await Promise.all([
-        kei.market.price(coin.asset, { from: [...traders] }).catch(() => null),
+      const from = [...traders]
+      const [price, holding, asks] = await Promise.all([
+        kei.market.price(coin.asset, { from }).catch(() => null),
         holders(coin.asset).catch(() => []),
+        // The board's "buyable now" chip, and the reason it is allowed to exist:
+        // it reads open `swap_offer` blocks off the same chains the book does.
+        kei.market.offers({ from, asset: coin.asset, state: 'open' }).catch(() => []),
       ])
       const stats: ListingStats = {
         last: price?.last ?? null,
         trades: price?.trades ?? 0,
         holders: holding.length,
         replies: options.replyCount?.(coin.asset) ?? 0,
+        asks: asks.length,
+        bestAsk: asks.length === 0 ? null : Math.min(...asks.map((offer) => unitPrice(offer, coin.asset))),
         creatorHolds: holding.find((row) => row.creator)?.amount ?? 0,
       }
       summaries.set(coin.asset, { at: Date.now(), stats })
       return stats
     } catch {
-      return cached?.stats ?? { last: null, trades: 0, holders: 0, replies: 0, creatorHolds: coin.supply }
+      return cached?.stats ?? NO_STATS(coin.supply)
     }
+  }
+
+  /**
+   * Everything that has settled lately, across every coin at once.
+   *
+   * One read rather than one per coin: `market.trades` without an `asset` walks
+   * the same chains the books walk and returns every `swap_accept` on them, so
+   * the whole board's activity costs what one coin's history costs. That is the
+   * property that makes a live ticker affordable here at all, and it is a
+   * block-lattice property — history is per-account, so "everything these
+   * accounts did" is a bounded walk rather than a ledger sweep (SPEC §9.1).
+   *
+   * It is still only as complete as the account list, exactly like the book, and
+   * the strip that renders it says so.
+   */
+  async function activity(limit: number): Promise<Trade[]> {
+    const fresh = activityCache && Date.now() - activityCache.at < SUMMARY_TTL_MS
+    if (!fresh) {
+      const trades = await kei.market
+        .trades({ from: [...traders], last: ACTIVITY_MAX })
+        .catch(() => activityCache?.trades ?? [])
+      activityCache = {
+        at: Date.now(),
+        trades: [...trades]
+          .filter((trade) => coins.has(trade.give.asset) || coins.has(trade.want.asset))
+          .sort((a, b) => (b.settledAt ?? b.seenAt) - (a.settledAt ?? a.seenAt)),
+      }
+    }
+    return activityCache!.trades.slice(0, limit)
   }
 
   // -------------------------------------------------------------------- plumbing
@@ -401,7 +503,7 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
       )
       return {
         address: kei.address,
-        network: kei.network,
+        chain: options.chain ?? { mode: 'mock', sdkNetwork: kei.network, node: null, ephemeral: true },
         launchFee: formatKei(LAUNCH_FEE_RAW, 18),
         listings,
       }
@@ -424,7 +526,15 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
       }
 
       if ((await rawBalance(kei.address)) < LAUNCH_FEE_RAW + LAUNCH_MARGIN_RAW) {
-        throw new RegistryError('The registry is out of working capital and cannot list anything right now.')
+        // Ask before refusing. The registry funds each new issuer out of its own
+        // balance, so it runs down at about a Kei a launch, and on a network
+        // with a faucet that is a top-up rather than an outage.
+        await topUp()
+        if ((await rawBalance(kei.address)) < LAUNCH_FEE_RAW + LAUNCH_MARGIN_RAW) {
+          throw new RegistryError(
+            'The registry is out of working capital and cannot list anything right now. It funds each new coin’s issuing account out of its own balance, and the faucet it refills from has said no.',
+          )
+        }
       }
 
       intents.set(creator, { at: Date.now(), symbol, name, blurb, transfer })
@@ -441,6 +551,8 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
 
     holders,
 
+    activity: (limit = 24) => activity(limit),
+
     watch(address) {
       if (typeof address === 'string' && address.startsWith('kei_')) traders.add(address)
     },
@@ -451,11 +563,6 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
       kei.close()
     },
   }
-}
-
-/** Cheapest first. `price` is `want` per one unit of `give` (SPEC §9.3). */
-function byPrice(a: Offer, b: Offer): number {
-  return a.price - b.price
 }
 
 /** A JS number of Kei, floored to raw. See the note at the payment handler. */

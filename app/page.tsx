@@ -1,76 +1,57 @@
 'use client'
 
 /**
- * The board. Everything listed, and the one that has traded most on top.
+ * The board. Everything listed, what has settled lately, and the one that has
+ * traded most on top.
  *
  * There is no marketing above this. The page's job is to let somebody judge a
  * coin and then trade it, so the first thing on screen is the coins — a hero
  * paragraph explaining what a launchpad is would push the only useful content
  * below the fold to say something the board says better.
  *
- * Every control here sorts or filters something the registry already sent. There
- * is no search box for a field that does not exist and no "volume, 24h" chip
- * over a number nobody computes: this list is the coins one registry has been
- * told about, and a control implying it is the whole network would be the same
- * lie as a market cap.
+ * Every control here sorts or filters something the registry already sent, and
+ * `lib/board.ts` is where the rule that keeps that true lives: a chip is only
+ * allowed to exist if there is a field behind it. There is no search box for a
+ * field that does not exist and no "volume, 24h" chip over a number nobody
+ * computes, because this list is the coins one registry has been told about and
+ * a control implying it is the whole network would be the same lie as a market
+ * cap.
  */
 
-import { useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import { Activity } from '../components/Activity'
 import { CoinCard } from '../components/CoinCard'
 import { crown, KingOfTheHill } from '../components/KingOfTheHill'
-import type { Listing, TransferPolicy } from '../shared/listing'
+import { arrange, DEFAULT_QUERY, FILTERS, narrowed, pulse, SORTS, type BoardQuery } from '../lib/board'
 import { useMarket } from '../lib/use-market'
 
-type Sort = 'new' | 'traded' | 'holders' | 'price' | 'dumped'
-type Filter = 'all' | TransferPolicy | 'held'
-
-const SORTS: { key: Sort; label: string; of(listing: Listing): number }[] = [
-  { key: 'new', label: 'newest', of: (listing) => listing.launchedAt },
-  { key: 'traded', label: 'most traded', of: (listing) => listing.stats?.trades ?? 0 },
-  { key: 'holders', label: 'most holders', of: (listing) => listing.stats?.holders ?? 0 },
-  { key: 'price', label: 'highest price', of: (listing) => listing.stats?.last ?? -1 },
-  {
-    key: 'dumped',
-    // The one sort the launchpads this is shaped like do not offer.
-    label: 'most sold off',
-    of: (listing) => -(listing.stats?.creatorHolds ?? listing.supply) / (listing.supply || 1),
-  },
-]
-
-const FILTERS: { key: Filter; label: string }[] = [
-  { key: 'all', label: 'everything' },
-  { key: 'open', label: 'tradable' },
-  { key: 'issuer-only', label: 'issuer only' },
-  { key: 'none', label: 'soulbound' },
-  { key: 'held', label: 'you hold' },
-]
-
 export default function Board() {
-  const { facts, holdings, fatal, loading } = useMarket()
-  const [query, setQuery] = useState('')
-  const [sort, setSort] = useState<Sort>('new')
-  const [filter, setFilter] = useState<Filter>('all')
+  const { facts, activity, holdings, trader, fatal, loading } = useMarket()
+  const [query, setQuery] = useState<BoardQuery>(DEFAULT_QUERY)
+  const search = useRef<HTMLInputElement>(null)
 
-  const listings = facts?.listings
-  const king = useMemo(() => (listings ? crown(listings) : null), [listings])
+  const listings = useMemo(() => facts?.listings ?? [], [facts])
+  const king = useMemo(() => crown(listings), [listings])
+  const shown = useMemo(() => arrange(listings, query, holdings), [listings, query, holdings])
+  const counts = useMemo(() => pulse(listings), [listings])
 
-  const shown = useMemo(() => {
-    if (!listings) return []
-    const needle = query.trim().toLowerCase()
-    const matched = listings.filter((listing) => {
-      if (filter === 'held' && (holdings.get(listing.asset) ?? 0) <= 0) return false
-      if (filter !== 'all' && filter !== 'held' && listing.transfer !== filter) return false
-      if (!needle) return true
-      return (
-        listing.symbol.toLowerCase().includes(needle) ||
-        listing.name.toLowerCase().includes(needle) ||
-        listing.blurb.toLowerCase().includes(needle)
-      )
-    })
-    const by = SORTS.find((entry) => entry.key === sort) ?? SORTS[0]
-    return matched.sort((a, b) => by!.of(b) - by!.of(a))
-  }, [listings, holdings, query, sort, filter])
+  // `/` focuses the search, the way it does in every list this page is competing
+  // with. Guarded on the target so it does not steal the key from a field
+  // somebody is already typing in.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent): void => {
+      const target = event.target as HTMLElement | null
+      if (event.key !== '/' || event.metaKey || event.ctrlKey) return
+      if (target && /^(input|textarea)$/i.test(target.tagName)) return
+      event.preventDefault()
+      search.current?.focus()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  const update = useCallback((patch: Partial<BoardQuery>) => setQuery((current) => ({ ...current, ...patch })), [])
 
   if (fatal) {
     return (
@@ -88,47 +69,92 @@ export default function Board() {
   if (loading && !facts) return <Skeleton />
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-4">
       {king && <KingOfTheHill listing={king} />}
 
-      <div className="space-y-2.5">
-        <div className="flex flex-wrap items-center gap-2">
-          <input
-            type="search"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search ticker, name, or blurb"
-            aria-label="Search coins by ticker, name, or blurb"
-            className="min-w-0 flex-1 rounded-md border border-line bg-panel px-3 py-2 text-sm placeholder:text-fainter focus:border-line-bright"
-          />
-          <Chips label="Sort by" options={SORTS} active={sort} onPick={setSort} />
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_18rem]">
+        <div className="min-w-0 space-y-3">
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="relative min-w-0 flex-1">
+                <span className="sr-only">Search coins by ticker, name, blurb, or address</span>
+                <input
+                  ref={search}
+                  type="search"
+                  value={query.text}
+                  onChange={(event) => update({ text: event.target.value })}
+                  placeholder="Search ticker, name, blurb, or paste an address"
+                  className="w-full rounded-md border border-line bg-panel px-3 py-2 pr-8 text-sm placeholder:text-fainter focus:border-line-bright"
+                />
+                <kbd className="pointer-events-none absolute right-2 top-1/2 hidden -translate-y-1/2 rounded border border-line px-1 font-mono text-[10px] text-fainter sm:block">
+                  /
+                </kbd>
+              </label>
+              <Chips
+                label="Sort by"
+                options={SORTS}
+                active={query.sort}
+                onPick={(sort) => update({ sort })}
+              />
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <Chips
+                label="Filter by"
+                options={FILTERS}
+                active={query.filter}
+                onPick={(filter) => update({ filter })}
+              />
+              <p className="ml-auto font-mono text-[10px] text-fainter tabular" aria-live="polite">
+                {shown.length} of {listings.length}
+              </p>
+            </div>
+          </div>
+
+          {shown.length === 0 ? (
+            <Empty listed={listings.length} narrowed={narrowed(query)} onClear={() => setQuery(DEFAULT_QUERY)} />
+          ) : (
+            <ul className="grid list-none gap-2.5 sm:grid-cols-2 xl:grid-cols-3">
+              {shown.map((listing) => (
+                // `min-w-0`, because a grid item's default minimum is its
+                // content and one long figure in a card would otherwise push
+                // the whole column past the viewport at 360 px.
+                <li key={listing.asset} className="min-w-0">
+                  <CoinCard listing={listing} held={holdings.get(listing.asset) ?? 0} />
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <Chips label="Filter by policy" options={FILTERS} active={filter} onPick={setFilter} />
-          <p className="ml-auto font-mono text-[10px] text-fainter tabular" aria-live="polite">
-            {shown.length} of {listings?.length ?? 0}
-          </p>
-        </div>
+        <aside className="min-w-0 space-y-3">
+          {/* Counts, not a market cap. Every one of these is a number of things
+              that exist rather than a valuation of them. */}
+          <dl className="panel grid grid-cols-2 gap-x-3 gap-y-2 p-3 lg:grid-cols-2">
+            <Count label="Listed" value={counts.listed} />
+            <Count label="Buyable now" value={counts.buyable} accent={counts.buyable > 0} />
+            <Count label="Have traded" value={counts.traded} />
+            <Count label="Trades" value={counts.trades} />
+          </dl>
+
+          <Activity trades={activity} listings={listings} you={trader?.address ?? null} />
+        </aside>
       </div>
-
-      {shown.length === 0 ? (
-        <Empty listed={listings?.length ?? 0} narrowed={query.trim().length > 0 || filter !== 'all'} />
-      ) : (
-        <ul className="grid list-none gap-2.5 sm:grid-cols-2 xl:grid-cols-3">
-          {shown.map((listing) => (
-            <li key={listing.asset}>
-              <CoinCard listing={listing} held={holdings.get(listing.asset) ?? 0} />
-            </li>
-          ))}
-        </ul>
-      )}
 
       <p className="border-t border-line pt-4 text-[11px] leading-relaxed text-fainter">
         This is the list of coins one registry has been told about, not the network. An offer written by a wallet that
         never announced itself is perfectly valid, settles perfectly well, and is not on this page — which is what it
         means for a chain to ship no indexer.
       </p>
+    </div>
+  )
+}
+
+function Count({ label, value, accent = false }: { label: string; value: number; accent?: boolean }) {
+  return (
+    <div>
+      <dt className="eyebrow">{label}</dt>
+      <dd className={`mt-0.5 font-mono text-lg tabular ${accent ? 'text-gold' : 'text-ink'}`}>{value}</dd>
     </div>
   )
 }
@@ -141,7 +167,7 @@ function Chips<T extends string>({
   onPick,
 }: {
   label: string
-  options: readonly { key: T; label: string }[]
+  options: readonly { key: T; label: string; hint: string }[]
   active: T
   onPick: (key: T) => void
 }) {
@@ -151,6 +177,7 @@ function Chips<T extends string>({
         <button
           key={option.key}
           type="button"
+          title={option.hint}
           aria-pressed={active === option.key}
           onClick={() => onPick(option.key)}
           className={`rounded border px-2 py-1 font-mono text-[10px] uppercase tracking-[0.08em] transition-colors ${
@@ -174,12 +201,15 @@ function Chips<T extends string>({
  */
 function Skeleton() {
   return (
-    <div className="space-y-2.5" role="status" aria-label="Loading the board">
-      <div className="panel h-28 animate-pulse motion-reduce:animate-none" />
-      <div className="grid gap-2.5 sm:grid-cols-2 xl:grid-cols-3">
-        {[0, 1, 2, 3, 4, 5].map((slot) => (
-          <div key={slot} className="panel h-24 animate-pulse motion-reduce:animate-none" />
-        ))}
+    <div className="space-y-3" role="status" aria-label="Loading the board">
+      <div className="panel h-32 animate-pulse motion-reduce:animate-none" />
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_18rem]">
+        <div className="grid gap-2.5 sm:grid-cols-2 xl:grid-cols-3">
+          {[0, 1, 2, 3, 4, 5].map((slot) => (
+            <div key={slot} className="panel h-28 animate-pulse motion-reduce:animate-none" />
+          ))}
+        </div>
+        <div className="panel hidden h-64 animate-pulse motion-reduce:animate-none lg:block" />
       </div>
     </div>
   )
@@ -188,17 +218,21 @@ function Skeleton() {
 /**
  * The empty board, which is what a visitor sees most often.
  *
- * The chain is a mock in one Durable Object, so it resets whenever that object
- * is evicted and the list goes empty on its own. Saying that here is better than
- * letting somebody conclude the demo is broken, and it is the same paragraph the
- * examples page carries.
+ * Two different empties, because they need two different sentences and one of
+ * them is not the visitor's fault. A filtered-to-nothing board offers the way
+ * back; a genuinely empty one explains that the chain under this page resets.
  */
-function Empty({ listed, narrowed }: { listed: number; narrowed: boolean }) {
+function Empty({ listed, narrowed, onClear }: { listed: number; narrowed: boolean; onClear: () => void }) {
   if (narrowed) {
     return (
-      <p className="panel p-8 text-center text-sm text-dim">
-        Nothing matches that. {listed} {listed === 1 ? 'coin is' : 'coins are'} listed.
-      </p>
+      <div className="panel p-8 text-center">
+        <p className="text-sm text-dim">
+          Nothing matches that. {listed} {listed === 1 ? 'coin is' : 'coins are'} listed.
+        </p>
+        <button type="button" onClick={onClear} className="btn-quiet mt-3 px-2.5 py-1 text-xs">
+          Clear the filters
+        </button>
+      </div>
     )
   }
   return (
@@ -206,8 +240,8 @@ function Empty({ listed, narrowed }: { listed: number; narrowed: boolean }) {
       <p className="text-sm text-ink">Nothing is listed yet.</p>
       <p className="mx-auto mt-2 max-w-md text-xs leading-relaxed text-fainter">
         Launching costs a little over one Kei, almost all of which is burned rather than collected — and the faucet in
-        the bar above hands out twenty-five. The chain under this page lives in memory, so an empty board usually means
-        it restarted rather than that nobody has been here.
+        the bar above hands out twenty-five. On the mock chain the ledger lives in memory, so an empty board usually
+        means it restarted rather than that nobody has been here.
       </p>
     </div>
   )

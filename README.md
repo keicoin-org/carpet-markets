@@ -12,6 +12,7 @@ the example of it.
 ```sh
 bun install
 bun run dev          # client on :3000, chain and registry on :7788
+bun run seed         # six coins and a market between them, so there is something to look at
 ```
 
 The client is Next.js and ships as a **static export** — plain HTML, CSS and JS
@@ -20,10 +21,33 @@ Bun process on :7788; the deployed copy has no proxy at all, because there a
 Cloudflare Worker serves the exported files and answers those two paths out of a
 Durable Object.
 
-> **This is a demo.** The chain underneath is an in-memory mock served by the
-> same process. It dies when you stop the server, every coin you can launch on it
-> is worthless by construction, and that is exactly what makes it safe to show
-> you how a market like this actually behaves.
+> **This is a demo, and every coin on it is worthless by construction.** That is
+> what makes it safe to show you how a market like this actually behaves.
+
+## Which chain is under it
+
+Two modes, and the badge in the bar always says which one is live — read off the
+server rather than compiled into the page, so it cannot disagree with the thing
+it describes.
+
+```sh
+bun run dev                              # mock: an in-memory chain in the same process
+CARPET_NETWORK=testnet bun run dev:api   # the public Kei testnet, over HTTP
+CARPET_NETWORK=mainnet bun run dev:api   # refused, by name, before it opens a socket
+```
+
+The public testnet carries the whole market path — `issue`, `mint`,
+`swap_offer`, `swap_accept`, `swap_cancel`, price history, and the policy
+refusal — and that is checked rather than asserted:
+
+```sh
+bun run probe:testnet
+```
+
+[`NETWORK.md`](NETWORK.md) carries the last run of it with the node's own
+answers, the end-to-end walk through the app, and the five things that gate
+mainnet. Four of them are arguments rather than builds, and nothing in this
+repository moves any of them.
 
 ## The point
 
@@ -56,7 +80,22 @@ The site never claims a coin is safe. It shows you what was issued.
 | **Launch** | Name a coin, pick who may move it, pay the fee. You are minted the whole supply. |
 | **Sell** | Write an offer: how many, and what you want for them. The coins lock until it settles or you cancel. |
 | **Buy** | Accept somebody's offer. One block, both legs, or neither. |
-| **Cancel** | Take back your own unaccepted offer, and the coins with it. |
+| **Bid** | The mirror of selling: lock Kei, and take the coins from whoever fills it. The only way to be a buyer when nobody is selling. |
+| **Cancel** | Take back your own unaccepted order, and whatever it locked. |
+
+### Both sides, and no matching engine
+
+A bid is a `swap_offer` with its legs the other way up — Kei locked, coins wanted
+— so the book has two sides without a second primitive, and filling either side
+is the same `swap_accept`.
+
+The trap that comes with it, which cost an afternoon: **`Offer.price` is
+`want.amount` per unit of `give`**, which is Kei-per-coin on an ask and
+*coins-per-Kei* on a bid. Rendered raw, a bid of 0.0003 Kei each appears as
+3,333.33 next to asks in the fourth decimal place, sorts the book upside down,
+and puts a spike into a chart of fractions. `unitPrice()` in `shared/listing.ts`
+is the one place that is undone, and `test/pricing.test.ts` is why it is allowed
+to be the only one.
 
 ### There is no curve, deliberately
 
@@ -94,20 +133,28 @@ anybody else's. Spam is still bounded, per launcher, exactly as the spec intende
 ## Where things are
 
 ```
-shared/format.ts      turning numbers into text. Used to be the bonding curve.
-shared/listing.ts     the wire shape, and what a valid coin identity is.
-shared/social.ts      replies, and the signature that makes one attributable.
-server/registry.ts    issues coins, and remembers who to read. The whole backend.
-server/main.ts        the mock node at /rpc and the registry at /market/*.
-worker/index.ts       the same two, on Cloudflare, in one Durable Object.
-lib/market.ts         every line of Kei in the client.
-lib/balance.ts        confirmed, incoming and in-flight money, kept apart.
-lib/use-market.tsx    the wallet, the poll, and where React finds out about them.
-app/page.tsx          the board.
-app/coin/page.tsx     one coin: chart, book, holders, replies.
-app/launch/page.tsx   the three-way choice the whole example is about.
-components/           the board's parts, including the woven coin marks.
-spawn.ts              running a command on an OS that disagrees what one is.
+shared/format.ts        turning numbers into text. Used to be the bonding curve.
+shared/listing.ts       the wire shape, a valid coin identity, and which way up a price is.
+shared/network.ts       mock, testnet, and the refusal that is not a schedule.
+shared/social.ts        replies, and the signature that makes one attributable.
+server/registry.ts      issues coins, and remembers who to read. The whole backend.
+server/network.ts       choosing the chain, once, for both deployments.
+server/main.ts          /rpc and the registry at /market/*, for `bun run dev`.
+worker/index.ts         the same two, on Cloudflare, in one Durable Object.
+lib/market.ts           every line of Kei in the client.
+lib/balance.ts          confirmed, incoming and in-flight money, kept apart.
+lib/tx.ts               what became of a signature, and whether a retry is honest.
+lib/refusals.ts         every reason a trade will not go through, worked out first.
+lib/board.ts            the board's sorts and filters, as arithmetic.
+lib/use-market.tsx      the wallet, the poll, and where React finds out about them.
+app/page.tsx            the board.
+app/coin/page.tsx       one coin: chart, book, holders, trades, replies.
+app/launch/page.tsx     the three-way choice the whole example is about.
+app/network/page.tsx    what is under the page, at length.
+components/             the board's parts, including the woven coin marks.
+scripts/testnet-probe.ts  whether a given node can carry this market.
+scripts/seed.ts         a board worth looking at, made out of ordinary blocks.
+spawn.ts                running a command on an OS that disagrees what one is.
 ```
 
 `lib/market.ts` is the file to read if you are here to learn `@keicoin/market`.
@@ -196,11 +243,39 @@ Written down because each one cost an afternoon.
   yours. A client filtering on it removes nothing and offers people their own
   coins back. Compare `offer.from` to the browser wallet's own address instead.
 
+### Nothing refuses a trade after the fact
+
+Every state that can stop an action is worked out before the click and named
+beside it — `lib/refusals.ts`, asserted sentence by sentence in
+`test/refusals.test.ts`. The three that matter are the three a block-lattice has
+and a bank account does not, and they need three different sentences:
+
+- Kei that **has arrived and is not signed for yet** is real, owed, and
+  unspendable. Saying "not enough Kei" here is actively false; the page says what
+  is settling and the button turns itself on.
+- Coins **locked into your own open offer** left the spendable balance when the
+  `swap_offer` block was written. The fix is a cancel, not a purchase, and only
+  that case says so.
+- A **transfer policy** makes the whole trade an invalid block. Nothing changes
+  it, so nothing suggests anything might, and the panel is absent rather than
+  disabled.
+
+After the click, `lib/tx.ts` decides what a failure *was*. A ledger refusal is
+not an outage — offering "try again" under `transfer: none` would teach people
+that consensus is a glitch — and a lost accept/cancel race is somebody else
+winning rather than a reason to try harder. A launch is never retryable at all,
+whatever went wrong: its first half sends a fee, and the fee buys a burn.
+
 ## Honest about what this is not
 
-- **Nothing here is worth anything**, on purpose. There is no mainnet, and a demo
-  about people losing money is not the place to find out what that feels like
-  with money in it.
+- **Nothing here is worth anything**, on purpose. On the mock chain the ledger is
+  in memory; on the public testnet the faucet gives Kei to anybody who asks and
+  the node is one best-effort box (SPEC §15). Neither is a place to find out what
+  losing money feels like with money in it, which is the whole reason this demo
+  can exist at all.
+- **Mainnet is refused rather than unimplemented.** Five gates, four of which are
+  arguments rather than builds. They are in [`NETWORK.md`](NETWORK.md), on the
+  `/network` page, and in `shared/network.ts` as `MAINNET_GATES`.
 - **The book is only as complete as the account list.** The registry lists offers
   from accounts it has heard of. An offer written by a wallet that never
   announced itself is perfectly valid, settles perfectly well, and does not
@@ -255,8 +330,23 @@ bun run check     # typecheck, worker typecheck, and the tests
 `test/registry.test.ts` is where the claim on the badge is either true or
 marketing. It asserts at the ledger that a soulbound coin cannot be offered at
 all, that an issuer-only coin cannot be traded between two holders, that an open
-one settles peer-to-peer in whatever size the seller chose, and that the launch
-fee does not move as coins pile up.
+one settles peer-to-peer in whatever size the seller chose, that a bid is the
+same block the other way up and a holder can fill it, and that the launch fee
+does not move as coins pile up.
+
+`test/refusals.test.ts` is criterion 2 of SPEC §9.6 as assertions: every state
+that can refuse a trade gets its own sentence, and the one that would otherwise
+be a lie — arrived-but-unsigned-for money reported as "not enough Kei" — is
+tested apart from the one that is true.
+
+`test/tx.test.ts` is the state machine a signature moves through, and the two
+rules in it that would cost somebody money: a policy refusal never offers a
+retry, and a launch never offers one whatever went wrong.
+
+`test/pricing.test.ts` pins which way up a price is, on both sides of the book.
+`test/board.test.ts` pins every sort and filter to the field it claims to read.
+`test/network.test.ts` pins the badge, the mainnet refusal, and the readiness
+verdict — including that neither runnable mode is described as worth anything.
 
 `test/social.test.ts` covers the other claim the UI makes — that the address on a
 reply wrote it. Every test in it is a way of trying to post as somebody else:

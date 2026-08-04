@@ -15,29 +15,52 @@
  * writes; this server never sees a player's key and cannot move their coins.
  */
 
-import { MockNode, mockRpcHandler, randomSeed } from 'kei-transaction'
+import { randomSeed } from 'kei-transaction'
 
+import { describeChain, openChain } from './network.js'
 import { ListingError } from '../shared/listing.js'
+import { NetworkRefused } from '../shared/network.js'
 import { ReplyError } from '../shared/social.js'
 import { RegistryError, startRegistry } from './registry.js'
 import { Threads, type PostReply } from './social.js'
 
 const port = Number(process.env.PORT ?? 7788)
 
-// A fresh chain every run, because it is in memory. A player's wallet lives in
-// their browser and outlives it, so they come back to an empty account on a new
-// chain — the honest behaviour for a mock, and the reason nothing here is worth
-// anything.
-const node = await MockNode.create({ faucetAmount: 25 })
-const rpc = mockRpcHandler({ node })
+/**
+ * Which chain, decided once and printed.
+ *
+ * Unset means the in-memory mock: a fresh ledger every run, so a player's
+ * browser wallet outlives the chain it was funded on and comes back to an empty
+ * account on a new one. That is the honest behaviour for a mock and the reason
+ * nothing on it is worth anything.
+ *
+ *   CARPET_NETWORK=testnet bun run dev:api
+ *
+ * points the same registry at the public Kei testnet instead, and `/rpc`
+ * becomes a pass-through to it rather than a node. `CARPET_NETWORK=mainnet` is
+ * refused here, before anything opens a socket.
+ */
+const chain = await openChain({
+  network: process.env.CARPET_NETWORK,
+  node: process.env.CARPET_NODE,
+}).catch((error: unknown) => {
+  if (error instanceof NetworkRefused) {
+    console.error(`\n  ${error.message}\n`)
+    process.exit(1)
+  }
+  throw error
+})
+
+const rpc = chain.rpc
 
 // Off-chain, and the only thing here that is. See `server/social.ts`.
 const threads = new Threads()
 
 const registry = await startRegistry({
   seed: process.env.CARPET_SEED ?? randomSeed(),
-  node,
-  network: 'mock',
+  node: chain.node,
+  network: chain.sdkNetwork,
+  chain: chain.facts,
   replyCount: (asset) => threads.count(asset),
 })
 
@@ -61,6 +84,9 @@ async function read<T>(request: Request): Promise<T> {
 const server = Bun.serve({
   port,
   routes: {
+    // On the mock this is the node. On the testnet it is a pass-through to one,
+    // and the browser's signed block goes out of here untouched — see
+    // `server/network.ts`.
     '/rpc': { POST: rpc, OPTIONS: rpc },
 
     '/market/facts': {
@@ -93,6 +119,19 @@ const server = Bun.serve({
         try {
           const asset = new URL(request.url).searchParams.get('asset') ?? ''
           return json({ holders: await registry.holders(asset) })
+        } catch (error) {
+          return failed(error)
+        }
+      },
+    },
+
+    // Everything that has settled lately, across every coin. One walk of the
+    // same chains the books walk — see `activity` in server/registry.ts.
+    '/market/activity': {
+      async GET(request) {
+        try {
+          const asked = Number(new URL(request.url).searchParams.get('limit') ?? 24)
+          return json({ trades: await registry.activity(Number.isFinite(asked) ? asked : 24) })
         } catch (error) {
           return failed(error)
         }
@@ -148,19 +187,16 @@ const server = Bun.serve({
 console.log(`
   Carpet Markets — the registry and the chain.
 
-  api           ${server.url}
-  node (mock)   ${server.url}rpc
-  registry      ${registry.address}
+  api        ${server.url}
+  rpc        ${server.url}rpc
+  chain      ${describeChain(chain.facts)}
+  registry   ${registry.address}
 
   The client is next dev, on :3000, and proxies /rpc and /market/* to here.
 
   The registry issues coins and remembers who to read. It does not price
   anything and never holds a coin: every trade here is an offer one player wrote
   and another accepted, settled in one block by consensus.
-
-  This chain is in memory and dies with this process. Every coin you can launch
-  here is worthless by construction, which is what makes it safe to show you how
-  the dump works.
 `)
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {

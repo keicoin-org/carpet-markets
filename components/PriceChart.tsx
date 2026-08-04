@@ -18,9 +18,16 @@ import { useEffect, useRef } from 'react'
 import type { Trade } from 'kei-transaction'
 
 import { formatPrice } from '../shared/format'
+import { unitPrice } from '../shared/listing'
 
-export function PriceChart({ trades }: { trades: readonly Trade[] }) {
+export function PriceChart({ trades, asset }: { trades: readonly Trade[]; asset: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+
+  // Kei per unit, both directions. A trade that settled a *bid* has its legs the
+  // other way up, so `trade.price` on it is units per Kei — plotted raw, one
+  // filled bid puts a spike of several thousand into a chart of fractions and
+  // flattens every real price to the floor.
+  const points = trades.map((trade) => unitPrice(trade, asset))
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -41,15 +48,15 @@ export function PriceChart({ trades }: { trades: readonly Trade[] }) {
       context.setTransform(ratio, 0, 0, ratio, 0, 0)
       context.clearRect(0, 0, width, height)
 
-      const points = trades.map((trade) => trade.price)
-      const first = points[0]
+      const plotted = [...points]
+      const first = plotted[0]
       if (first === undefined) return
-      if (points.length === 1) points.push(first)
+      if (plotted.length === 1) plotted.push(first)
 
-      const top = Math.max(...points)
-      const bottom = Math.min(...points)
+      const top = Math.max(...plotted)
+      const bottom = Math.min(...plotted)
       const padding = 10
-      const stepX = width / (points.length - 1 || 1)
+      const stepX = width / (plotted.length - 1 || 1)
 
       // Every trade at the same price is a real flat line, and it is drawn down
       // the middle rather than along the floor. Scaling a zero range puts it at
@@ -60,7 +67,7 @@ export function PriceChart({ trades }: { trades: readonly Trade[] }) {
       const y = (value: number): number =>
         flat ? height / 2 : height - padding - ((value - bottom) / span) * (height - padding * 2)
 
-      const last = points[points.length - 1] ?? first
+      const last = plotted[plotted.length - 1] ?? first
       const line = last < first ? '#ff6b6b' : '#6ee787'
 
       // A faint rule at the opening price, so "up" and "down" are visible rather
@@ -75,7 +82,7 @@ export function PriceChart({ trades }: { trades: readonly Trade[] }) {
       context.setLineDash([])
 
       const path = new Path2D()
-      points.forEach((value, index) => {
+      plotted.forEach((value, index) => {
         const x = index * stepX
         if (index === 0) path.moveTo(x, y(value))
         else path.lineTo(x, y(value))
@@ -100,7 +107,7 @@ export function PriceChart({ trades }: { trades: readonly Trade[] }) {
       // The last trade, marked, because it is the number in the header above.
       context.fillStyle = line
       context.beginPath()
-      context.arc((points.length - 1) * stepX - 1.5, y(last), 2.75, 0, Math.PI * 2)
+      context.arc((plotted.length - 1) * stepX - 1.5, y(last), 2.75, 0, Math.PI * 2)
       context.fill()
     }
 
@@ -108,23 +115,49 @@ export function PriceChart({ trades }: { trades: readonly Trade[] }) {
     const observer = new ResizeObserver(draw)
     if (canvas.parentElement) observer.observe(canvas.parentElement)
     return () => observer.disconnect()
-  }, [trades])
+    // `points` rather than `trades`: the array identity changes on every poll,
+    // and redrawing the same numbers is cheap but redrawing them sixty times a
+    // second while a canvas resizes is not.
+  }, [points.join(',')])
 
-  const last = trades[trades.length - 1]
-  const first = trades[0]
+  const opened = points[0]
+  const closed = points[points.length - 1]
+  const high = points.length > 0 ? Math.max(...points) : null
+  const low = points.length > 0 ? Math.min(...points) : null
+  const rose = opened !== undefined && closed !== undefined && closed >= opened
 
   return (
-    <div className="relative h-44 w-full overflow-hidden rounded-md border border-line bg-floor">
-      <canvas ref={canvasRef} className="block h-44 w-full" />
-      {trades.length === 0 && (
+    <div className="relative h-52 w-full overflow-hidden rounded-md border border-line bg-floor">
+      <canvas ref={canvasRef} className="block h-52 w-full" />
+
+      {trades.length === 0 ? (
         <p className="absolute inset-0 grid place-items-center px-6 text-center text-sm text-fainter">
           Never traded. There is nothing to plot until two people agree on a number.
         </p>
-      )}
-      {last && first && (
-        <div className="pointer-events-none absolute left-2.5 top-2 font-mono text-[10px] text-fainter tabular">
-          {formatPrice(first.price)} → {formatPrice(last.price)} Kei
-        </div>
+      ) : (
+        <>
+          {/* The scale, in the corners rather than on an axis. Four points of
+              history do not earn gridlines, and drawing them would imply a
+              continuous series where there is a list of agreements. */}
+          <div className="pointer-events-none absolute left-2.5 top-2 flex items-baseline gap-2 font-mono text-[10px] tabular">
+            <span className="text-fainter">
+              {trades.length} settled swap{trades.length === 1 ? '' : 's'}
+            </span>
+            <span className={rose ? 'text-up' : 'text-down'}>
+              {formatPrice(opened!)} → {formatPrice(closed!)} Kei
+            </span>
+          </div>
+          {high !== null && low !== null && high !== low && (
+            <>
+              <span className="pointer-events-none absolute right-2.5 top-2 font-mono text-[10px] text-fainter tabular">
+                high {formatPrice(high)}
+              </span>
+              <span className="pointer-events-none absolute bottom-2 right-2.5 font-mono text-[10px] text-fainter tabular">
+                low {formatPrice(low)}
+              </span>
+            </>
+          )}
+        </>
       )}
     </div>
   )

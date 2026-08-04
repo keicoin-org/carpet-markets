@@ -23,43 +23,30 @@ import type { Reply } from '../shared/social'
 import { REPLY_MAX } from '../shared/social'
 import { useMarket } from '../lib/use-market'
 
-export function Replies({
-  listing,
-  replies,
-  onPosted,
-}: {
-  listing: Listing
-  replies: Reply[]
-  onPosted: () => void
-}) {
+export function Replies({ listing, replies }: { listing: Listing; replies: Reply[] }) {
   const { trader, busy, act } = useMarket()
   const [draft, setDraft] = useState('')
 
   const post = (): void => {
     const text = draft
-    void act('Posting', async () => {
+    void act('reply', 'Posting', async () => {
       await trader?.reply(listing.asset, text)
       setDraft('')
-      onPosted()
     })
   }
 
   return (
-    <section className="panel p-3">
-      <div className="flex items-baseline justify-between gap-2">
-        <h3 className="eyebrow">Replies</h3>
-        <span
-          title="Replies are stored by the registry, not written to the chain. They are signed, so authorship is provable; they are not blocks, so consensus knows nothing about them and they are lost when the chain resets."
-          className="cursor-help rounded border border-line px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.1em] text-fainter"
-        >
-          off-chain · signed
-        </span>
-      </div>
+    <section className="p-3">
+      <p className="rounded border border-line bg-floor px-2.5 py-2 text-[11px] leading-relaxed text-fainter">
+        This thread is the only thing on the page that is not a block. The registry stores it, the registry can lose
+        it, and consensus has never seen it. What the signature buys is narrower and still worth having: nobody can
+        post as the creator.
+      </p>
 
       {replies.length === 0 ? (
         <p className="py-4 text-center text-xs text-fainter">Nothing said about this one yet.</p>
       ) : (
-        <ul className="mt-2.5 max-h-80 space-y-2.5 overflow-y-auto pr-1">
+        <ul className="mt-2.5 max-h-96 space-y-2.5 overflow-y-auto pr-1">
           {replies.map((reply) => {
             const author =
               reply.author === listing.creator ? 'creator' : reply.author === trader?.address ? 'you' : null
