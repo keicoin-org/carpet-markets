@@ -49,6 +49,8 @@ export interface ChainConfig {
   node?: string | undefined
   /** Kei the mock faucet hands out. Ignored on testnet, where the node decides. */
   faucetAmount?: number
+  /** Worker-only: mock mutations can be replayed from Durable Object storage. */
+  durable?: boolean
 }
 
 /**
@@ -76,7 +78,7 @@ export async function openChain(config: ChainConfig = {}): Promise<ChainSource> 
   return {
     node,
     sdkNetwork: 'mock',
-    facts: { mode, sdkNetwork: 'mock', node: null, ephemeral: true },
+    facts: { mode, sdkNetwork: 'mock', node: null, ephemeral: !config.durable },
     rpc: (request) => handler(request),
   }
 }

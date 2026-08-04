@@ -1,24 +1,16 @@
 /**
  * Carpet Markets, on Cloudflare, at keicoin.org/examples/carpet-markets.
  *
- * The same three things `bun run dev` serves locally are served here: the mock
- * node, the market, and the client.
- *
- * The chain lives in **one Durable Object**, because a chain that differed per
- * request would not be a chain — and because a market where two visitors saw
- * different prices for the same coin would be a worse joke than the one this
- * game is telling. That is also the honest shape of the thing: this is a
- * single-node mock, not a network, and a Durable Object is a single node. When
- * the object is evicted the chain resets, which the examples page says.
- *
- * The player's key never comes here. It is generated in their browser, kept in
- * their browser, and signs every block this Worker sees — including the one that
- * pulls the carpet.
+ * The mock ledger, registry index and signed threads live in one Durable Object.
+ * A versioned event log in that object's storage is authoritative; the classes
+ * in memory are disposable caches rebuilt by replay after eviction. This is
+ * still one mock node, not a network, and every demo coin is worth nothing.
  */
 
 import { DurableObject } from 'cloudflare:workers'
-import { randomSeed } from 'kei-transaction'
+import { randomSeed, type KeiNode } from 'kei-transaction'
 
+import { DEMO_REGISTRY_SEED, seedDemo } from '../server/demo.js'
 import { openChain, type ChainSource } from '../server/network.js'
 import { ListingError } from '../shared/listing.js'
 import { NetworkRefused } from '../shared/network.js'
@@ -29,23 +21,30 @@ import { Threads, type PostReply } from '../server/social.js'
 interface Env {
   ASSETS: Fetcher
   FLOOR: DurableObjectNamespace<Floor>
-  /** Optional. Without it the market is new on every boot, which is fine here. */
+  /** Optional stable registry seed. Changing it requires resetting DO storage. */
   CARPET_SEED?: string
-  /**
-   * `mock` (the default) or `testnet`. `mainnet` is refused, loudly, on boot.
-   *
-   * It is a variable rather than a constant because the same bundle is served
-   * from more than one place and the honest answer differs — and because the
-   * client reads it back out of `/market/facts` rather than out of its own
-   * build, so a deploy that changes this changes the badge with it.
-   */
+  /** `mock` (default) or `testnet`; `mainnet` is refused on boot. */
   CARPET_NETWORK?: string
-  /** The node URL when `CARPET_NETWORK=testnet`. Defaults to the public one. */
+  /** Node URL when `CARPET_NETWORK=testnet`. */
   CARPET_NODE?: string
 }
 
-/** Everything under the mount point that is not a static file. */
+type EventInput =
+  | { at: number; kind: 'seed'; registryAddress: string }
+  | { at: number; kind: 'rpc'; body: string }
+  | { at: number; kind: 'launch'; body: { address: string } & Record<string, unknown> }
+  | { at: number; kind: 'watch'; address: string }
+  | { at: number; kind: 'reply'; body: PostReply }
+
+type StoredEvent = EventInput & { version: 1; sequence: number; status: 'pending' | 'accepted' }
+
+const EVENT_PREFIX = 'event:v1:'
+const NEXT_SEQUENCE = 'meta:event-sequence:v1'
 const MOUNT = '/examples/carpet-markets'
+
+function eventKey(sequence: number): string {
+  return `${EVENT_PREFIX}${sequence.toString().padStart(12, '0')}`
+}
 
 function apiPath(url: URL): string | null {
   const path = url.pathname.startsWith(MOUNT) ? url.pathname.slice(MOUNT.length) : url.pathname
@@ -54,39 +53,110 @@ function apiPath(url: URL): string | null {
 
 export class Floor extends DurableObject<Env> {
   #booting: Promise<{ registry: Registry; chain: ChainSource }> | undefined
+  #now = Date.now()
+  #threads = new Threads(() => this.#now)
+  readonly #stored: Promise<StoredEvent[]>
+  readonly #mutations = new Queue()
 
-  /**
-   * The reply threads, in memory beside the chain and lost with it.
-   *
-   * They are not persisted to the object's storage on purpose. A thread that
-   * outlived the coins it is about would be a wall of comments on assets that no
-   * longer exist, which is a worse artefact than an empty page.
-   */
-  readonly #threads = new Threads()
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env)
+    // Storage initialization only: crypto, chain construction and replay remain
+    // outside blockConcurrencyWhile so the gate never contains long work.
+    this.#stored = ctx.blockConcurrencyWhile(async () => {
+      const rows = await ctx.storage.list<StoredEvent>({ prefix: EVENT_PREFIX })
+      return [...rows.values()].sort((a, b) => a.sequence - b.sequence)
+    })
+  }
 
-  /**
-   * One chain and one registry, built on the first request and kept.
-   *
-   * On the mock the object *is* the chain, so an eviction resets the market — an
-   * empty board means the object restarted rather than that nobody came. On the
-   * testnet the object is not the chain at all: it holds the registry, and
-   * `/rpc` is a pass-through to a node somewhere else, so an eviction loses the
-   * list of coins and none of the blocks.
-   */
   #ready(): Promise<{ registry: Registry; chain: ChainSource }> {
     this.#booting ??= (async () => {
       const chain = await openChain({
         network: this.env.CARPET_NETWORK,
         node: this.env.CARPET_NODE,
+        durable: true,
       })
+
+      // Testnet is somebody else's persistent chain. It remains a pass-through;
+      // local DO storage must not be presented as authority for remote state.
+      if (chain.sdkNetwork !== 'mock') {
+        const registry = await startRegistry({
+          seed: this.env.CARPET_SEED ?? randomSeed(),
+          node: chain.node,
+          network: chain.sdkNetwork,
+          chain: chain.facts,
+          replyCount: (asset) => this.#threads.count(asset),
+        })
+        return { registry, chain }
+      }
+
+      const stored = await this.#stored
+      const registrySeed = this.env.CARPET_SEED ?? DEMO_REGISTRY_SEED
       const registry = await startRegistry({
-        seed: this.env.CARPET_SEED ?? randomSeed(),
+        seed: registrySeed,
         node: chain.node,
         network: chain.sdkNetwork,
         chain: chain.facts,
         replyCount: (asset) => this.#threads.count(asset),
+        now: () => this.#now,
       })
-      return { registry, chain }
+      const state = { registry, chain }
+
+      const seedEvent = stored.find(
+        (event): event is StoredEvent & { kind: 'seed'; registryAddress: string } => event.kind === 'seed',
+      )
+      if (stored.length > 0 && !seedEvent) {
+        registry.close()
+        throw new Error('The stored mock event log has no seed record. Reset the named carpet-markets Durable Object storage.')
+      }
+      if (seedEvent && seedEvent.registryAddress !== registry.address) {
+        registry.close()
+        throw new Error(
+          'CARPET_SEED does not match this mock market\'s stored public registry identity. Restore the prior setting or reset the named carpet-markets Durable Object storage before changing it.',
+        )
+      }
+
+      if (stored.length === 0) {
+        const seeded = await this.#append({ kind: 'seed', registryAddress: registry.address, at: Date.now() })
+        try {
+          await this.#apply(seeded.event, state)
+          await this.#accept(seeded.event)
+        } catch (error) {
+          await this.ctx.storage.delete(seeded.key)
+          registry.close()
+          throw error
+        }
+      } else {
+        try {
+          for (const event of stored) {
+            try {
+              const response = await this.#apply(event, state)
+              if (response instanceof Response) {
+                const failure = await responseFailure(response)
+                if (failure) {
+                  if (event.status === 'pending') {
+                    await this.ctx.storage.delete(eventKey(event.sequence))
+                    continue
+                  }
+                  throw new Error(`Persisted ${event.kind} event ${event.sequence} failed replay: ${failure}`)
+                }
+              }
+              if (event.status === 'pending') await this.#accept(event)
+            } catch (error) {
+              if (event.status === 'pending' && expectedRejection(error)) {
+                await this.ctx.storage.delete(eventKey(event.sequence))
+                continue
+              }
+              throw error
+            }
+          }
+        } catch (error) {
+          registry.close()
+          throw error
+        }
+      }
+
+      this.#now = Date.now()
+      return state
     })()
     return this.#booting
   }
@@ -101,52 +171,64 @@ export class Floor extends DurableObject<Env> {
     try {
       ;({ registry, chain } = await this.#ready())
     } catch (error) {
-      // A refused network is a deployment mistake, and it has to read like one:
-      // an object that half-booted and served a mock instead would be the exact
-      // quiet degradation `shared/network.ts` exists to prevent.
       this.#booting = undefined
+      // A failed replay may have populated part of an in-memory thread cache.
+      // The durable log remains authoritative, so a retry starts that cache over.
+      this.#threads = new Threads(() => this.#now)
       const message = error instanceof Error ? error.message : String(error)
       return json({ error: message }, error instanceof NetworkRefused ? 503 : 500)
     }
 
-    if (path === '/rpc') return chain.rpc(request)
+    if (path === '/rpc') {
+      if (chain.sdkNetwork !== 'mock') return chain.rpc(request)
+      const body = await request.clone().text()
+      let action: unknown
+      try {
+        action = (JSON.parse(body) as { action?: unknown }).action
+      } catch {
+        return chain.rpc(request)
+      }
+      if (action !== 'process' && action !== 'faucet') return chain.rpc(request)
+      try {
+        return await this.#mutate({ kind: 'rpc', body, at: Date.now() }, { registry, chain })
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 500)
+      }
+    }
 
     try {
       switch (path) {
         case '/market/facts':
           return json(await registry.facts())
-
         case '/market/book':
           return json(await registry.book(url.searchParams.get('asset') ?? ''))
-
         case '/market/holders':
           return json({ holders: await registry.holders(url.searchParams.get('asset') ?? '') })
-
         case '/market/activity': {
           const asked = Number(url.searchParams.get('limit') ?? 24)
           return json({ trades: await registry.activity(Number.isFinite(asked) ? asked : 24) })
         }
-
         case '/market/replies':
           return json({ replies: this.#threads.list(url.searchParams.get('asset') ?? '') })
-
         case '/market/reply': {
           const body = await read<PostReply>(request)
           if (!registry.listing(body.asset)) throw new ListingError('That coin is not listed here.')
-          return json(await this.#threads.add(body))
+          if (chain.sdkNetwork !== 'mock') return json(await this.#threads.add(body))
+          return this.#mutate({ kind: 'reply', body, at: Date.now() }, { registry, chain })
         }
-
         case '/market/launch': {
           const body = await read<{ address: string } & Record<string, unknown>>(request)
-          return json(await registry.quoteLaunch(body.address, body))
+          if (chain.sdkNetwork !== 'mock') return json(await registry.quoteLaunch(body.address, body))
+          return this.#mutate({ kind: 'launch', body, at: Date.now() }, { registry, chain })
         }
-
         case '/market/watch': {
           const { address } = await read<{ address: string }>(request)
-          registry.watch(address)
-          return json({ watching: true })
+          if (chain.sdkNetwork !== 'mock') {
+            registry.watch(address)
+            return json({ watching: true })
+          }
+          return this.#mutate({ kind: 'watch', address, at: Date.now() }, { registry, chain })
         }
-
         default:
           return new Response('Not found', { status: 404 })
       }
@@ -156,14 +238,101 @@ export class Floor extends DurableObject<Env> {
       return json({ error: message }, theirs ? 400 : 500)
     }
   }
+
+  async #append(input: EventInput): Promise<{ key: string; event: StoredEvent }> {
+    return this.ctx.storage.transaction(async (storage) => {
+      const sequence = (await storage.get<number>(NEXT_SEQUENCE)) ?? 0
+      const event = { version: 1 as const, sequence, status: 'pending' as const, ...input } as StoredEvent
+      const key = eventKey(sequence)
+      // Failed events are deleted but this counter is not rewound. Gaps retain
+      // the order of later accepted inputs and are intentionally harmless.
+      await storage.put({ [key]: event, [NEXT_SEQUENCE]: sequence + 1 })
+      return { key, event }
+    })
+  }
+
+  async #accept(event: StoredEvent): Promise<void> {
+    await this.ctx.storage.put(eventKey(event.sequence), { ...event, status: 'accepted' })
+  }
+
+  async #mutate(
+    input: EventInput,
+    state: { registry: Registry; chain: ChainSource },
+  ): Promise<Response> {
+    return this.#mutations.run(async () => {
+      // Write-ahead is what makes a crash between receipt and application safe.
+      // Failed mock blocks are atomic in MockLedger; quote/reply validation runs
+      // before their cache writes. Those failures can therefore remove their
+      // event without leaving accepted state that a cold replay would omit.
+      const stored = await this.#append(input)
+      try {
+        const response = await this.#apply(stored.event, state)
+        if (response instanceof Response && (await responseFailure(response))) {
+          await this.ctx.storage.delete(stored.key)
+        } else {
+          await this.#accept(stored.event)
+        }
+        return response instanceof Response ? response : json(response)
+      } catch (error) {
+        await this.ctx.storage.delete(stored.key)
+        throw error
+      } finally {
+        this.#now = Date.now()
+      }
+    })
+  }
+
+  async #apply(
+    event: StoredEvent,
+    state: { registry: Registry; chain: ChainSource },
+  ): Promise<Response | unknown> {
+    this.#now = event.at
+    switch (event.kind) {
+      case 'seed':
+        await seedDemo({
+          node: state.chain.node as KeiNode,
+          registry: state.registry,
+          threads: this.#threads,
+          now: event.at,
+        })
+        return { seeded: true }
+      case 'rpc': {
+        const response = await state.chain.rpc(
+          new Request('https://durable.invalid/rpc', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: event.body,
+          }),
+        )
+        if (!(await responseFailure(response))) await state.registry.flush()
+        return response
+      }
+      case 'launch':
+        return state.registry.quoteLaunch(event.body.address, event.body)
+      case 'watch':
+        state.registry.watch(event.address)
+        return { watching: true }
+      case 'reply':
+        if (!state.registry.listing(event.body.asset)) throw new ListingError('That coin is not listed here.')
+        return this.#threads.add(event.body)
+    }
+  }
+}
+
+class Queue {
+  #tail: Promise<unknown> = Promise.resolve()
+
+  run<T>(job: () => Promise<T>): Promise<T> {
+    const next = this.#tail.then(job, job)
+    this.#tail = next.catch(() => undefined)
+    return next
+  }
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
     if (apiPath(url)) {
-      // One name, so every visitor shares one market — which is what makes a
-      // price a price rather than a save file.
       const floor = env.FLOOR.get(env.FLOOR.idFromName('carpet-markets'))
       return floor.fetch(request)
     }
@@ -173,6 +342,20 @@ export default {
 
 function json(value: unknown, status = 200): Response {
   return Response.json(value, { status })
+}
+
+async function responseFailure(response: Response): Promise<string | undefined> {
+  if (!response.ok) return (await response.clone().text()) || `HTTP ${response.status}`
+  try {
+    const body = (await response.clone().json()) as { error?: unknown }
+    return typeof body?.error === 'string' ? body.error : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function expectedRejection(error: unknown): boolean {
+  return error instanceof ListingError || error instanceof RegistryError || error instanceof ReplyError
 }
 
 async function read<T>(request: Request): Promise<T> {

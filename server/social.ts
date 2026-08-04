@@ -12,7 +12,8 @@
  * (`shared/social.ts` explains the scheme), and it is not trusted for anything
  * about a price, because it never sees one.
  *
- * The threads die when the process does, exactly like the chain they sit beside.
+ * They are in-memory here. The Worker persists their validated inputs in its
+ * event log and rebuilds them after eviction; the local Bun server does not.
  */
 
 import { publicKeyFromAddress, verifyHash } from '@keicoin/core'
@@ -55,6 +56,8 @@ export class Threads {
   readonly #byAsset = new Map<string, Reply[]>()
   readonly #seen = new Set<string>()
 
+  constructor(private readonly now: () => number = Date.now) {}
+
   /** Newest last, which is the order a thread is read in. */
   list(asset: string): Reply[] {
     return [...(this.#byAsset.get(asset) ?? [])]
@@ -80,7 +83,7 @@ export class Threads {
     const at = Number(input.at)
     if (!Number.isFinite(at)) throw new ReplyError('That reply has no timestamp.')
 
-    const age = Date.now() - at
+    const age = this.now() - at
     if (age > FRESH_MS) throw new ReplyError('That reply was signed too long ago to post now.')
     if (age < -REPLY_CLOCK_SKEW_MS) throw new ReplyError('That reply is dated in the future.')
 

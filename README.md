@@ -19,7 +19,9 @@ The client is Next.js and ships as a **static export** — plain HTML, CSS and J
 with no Node server behind it. `next dev` proxies `/rpc` and `/market/*` to the
 Bun process on :7788; the deployed copy has no proxy at all, because there a
 Cloudflare Worker serves the exported files and answers those two paths out of a
-Durable Object.
+Durable Object. That deployed object starts with the same deterministic six-coin
+board and replays its storage-backed event log after eviction, so a first visit
+has something buyable and an accepted buy is still there after a cold start.
 
 > **This is a demo, and every coin on it is worthless by construction.** That is
 > what makes it safe to show you how a market like this actually behaves.
@@ -31,7 +33,7 @@ server rather than compiled into the page, so it cannot disagree with the thing
 it describes.
 
 ```sh
-bun run dev                              # mock: an in-memory chain in the same process
+bun run dev                              # local mock: resets when this process stops
 CARPET_NETWORK=testnet bun run dev:api   # the public Kei testnet, over HTTP
 CARPET_NETWORK=mainnet bun run dev:api   # refused, by name, before it opens a socket
 ```
@@ -208,15 +210,26 @@ Everything it reports is read back off the chain. A reader with the same list of
 accounts gets the same answer without asking this server anything, which is the
 property worth having and the reason it is an index rather than an oracle.
 
-## No database
+## No balance database
 
 There is no `users` table, no `balances` table, no `holdings` table, and no save
 file. Who holds which coin is a question the chain answers, and asking it is
 `balanceOf`.
 
-What is in memory is the part the chain has no opinion about: which coins exist,
-who to read, and which quotes are outstanding. Stop the process and that is gone
-— along with the mock chain it was describing, so nothing is left dangling.
+The local Bun mock is deliberately ephemeral: stop it and its chain, listings,
+and threads are gone. The deployed Worker has a different lifecycle. Before it
+accepts a mutating mock request, `Floor` appends the versioned JSON-safe input to
+Durable Object storage; after eviction a fresh `Floor` replays those inputs into
+new in-memory ledger, registry, and thread instances. Cryptographic objects and
+the operator's `CARPET_SEED` are never serialized; the fixed no-value bootstrap
+wallets are public code fixtures. Testnet is not replayed this way: `/rpc`
+remains a pass-through and its remote chain is the authority.
+
+The event log is append-only and intentionally small-demo infrastructure, not an
+indexer or a production ledger. It grows with successful faucet, block, launch,
+watch, and reply mutations. Resetting the public mock means deleting the named
+`carpet-markets` Durable Object's storage; changing `CARPET_SEED` requires the
+same reset. Eviction, a Worker restart, or a routine deploy does not reset it.
 
 ## Four things worth stealing
 
@@ -268,8 +281,8 @@ whatever went wrong: its first half sends a fee, and the fee buys a burn.
 
 ## Honest about what this is not
 
-- **Nothing here is worth anything**, on purpose. On the mock chain the ledger is
-  in memory; on the public testnet the faucet gives Kei to anybody who asks and
+- **Nothing here is worth anything**, on purpose. The mock ledger is rebuilt in
+  memory from demo-only Durable Object events; on the public testnet the faucet gives Kei to anybody who asks and
   the node is one best-effort box (SPEC §15). Neither is a place to find out what
   losing money feels like with money in it, which is the whole reason this demo
   can exist at all.

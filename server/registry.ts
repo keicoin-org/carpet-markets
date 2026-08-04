@@ -77,6 +77,8 @@ export interface RegistryOptions {
    * to render and never reads the text.
    */
   replyCount?(asset: string): number
+  /** Injectable clock used while a Durable Object replays persisted events. */
+  now?(): number
 }
 
 export interface Registry {
@@ -91,6 +93,10 @@ export interface Registry {
   holders(asset: string): Promise<Holder[]>
   /** Settled trades across every listed coin, newest first. */
   activity(limit?: number): Promise<Trade[]>
+  /** Drain receives and registry writes before a mutating request is acknowledged. */
+  flush(): Promise<void>
+  /** Drop derived read caches after a deterministic bootstrap finishes. */
+  invalidate(): void
   /**
    * Tell the registry an address is worth reading.
    *
@@ -182,6 +188,7 @@ interface Intent {
 }
 
 export async function startRegistry(options: RegistryOptions): Promise<Registry> {
+  const now = options.now ?? Date.now
   const kei = await Kei.server({
     seed: options.seed,
     node: options.node,
@@ -319,7 +326,7 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
       creator,
       transfer: intent.transfer,
       supply: LAUNCH_SUPPLY,
-      launchedAt: Date.now(),
+      launchedAt: now(),
       issuerWallet: issuer,
     })
     traders.add(creator)
@@ -482,8 +489,8 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
   }
 
   function take(address: string): Intent | undefined {
-    const now = Date.now()
-    for (const [who, intent] of intents) if (now - intent.at > ttl) intents.delete(who)
+    const current = now()
+    for (const [who, intent] of intents) if (current - intent.at > ttl) intents.delete(who)
     const intent = intents.get(address)
     intents.delete(address)
     return intent
@@ -543,7 +550,7 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
         }
       }
 
-      intents.set(creator, { at: Date.now(), symbol, name, blurb, transfer })
+      intents.set(creator, { at: now(), symbol, name, blurb, transfer })
       traders.add(creator)
       return { symbol, name, to: kei.address, fee: formatKei(LAUNCH_FEE_RAW, 18) }
     },
@@ -558,6 +565,16 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
     holders,
 
     activity: (limit = 24) => activity(limit),
+
+    async flush() {
+      await kei.sync()
+      await writes.idle()
+    },
+
+    invalidate() {
+      summaries.clear()
+      activityCache = undefined
+    },
 
     watch(address) {
       if (typeof address === 'string' && address.startsWith('kei_')) traders.add(address)
@@ -594,6 +611,10 @@ class Queue {
       console.error('  registry write failed:', error instanceof Error ? error.message : error)
     })
     return next
+  }
+
+  async idle(): Promise<void> {
+    await this.tail
   }
 }
 

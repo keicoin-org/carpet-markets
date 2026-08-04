@@ -3,8 +3,8 @@
  *
  * Everything else in this example is on the chain, and saying so is most of the
  * point. This is not. A reply thread is a comment box: the registry stores it,
- * the registry can lose it, and when the Durable Object is evicted it goes with
- * the coins. No block is written and no consensus is reached about whether
+ * and on the deployed mock its signed input is replayed with the rest of the
+ * Durable Object event log. No block is written and no consensus is reached about whether
  * somebody thinks a coin is going to zero.
  *
  * What *is* worth having is authorship. A launchpad where anybody can post as
