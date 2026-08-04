@@ -28,20 +28,34 @@ const { Floor } = (await import('../worker/' + 'index.ts')) as {
 
 class FakeStorage {
   readonly values = new Map<string, unknown>()
+  failPointer = false
 
-  async get<T>(key: string): Promise<T | undefined> {
-    return this.values.get(key) as T | undefined
+  async get<T>(key: string): Promise<T | undefined>
+  async get<T>(keys: string[]): Promise<Map<string, T>>
+  async get<T>(keyOrKeys: string | string[]): Promise<T | undefined | Map<string, T>> {
+    if (typeof keyOrKeys === 'string') return this.values.get(keyOrKeys) as T | undefined
+    const found = new Map<string, T>()
+    for (const key of keyOrKeys) {
+      if (this.values.has(key)) found.set(key, structuredClone(this.values.get(key)) as T)
+    }
+    return found
   }
 
   async put(key: string, value: unknown): Promise<void>
   async put(entries: Record<string, unknown>): Promise<void>
   async put(keyOrEntries: string | Record<string, unknown>, value?: unknown): Promise<void> {
     const entries = typeof keyOrEntries === 'string' ? { [keyOrEntries]: value } : keyOrEntries
+    if (this.failPointer && 'meta:checkpoint:v2' in entries) throw new Error('simulated pointer failure')
     for (const [key, entry] of Object.entries(entries)) this.values.set(key, structuredClone(entry))
   }
 
-  async delete(key: string): Promise<boolean> {
-    return this.values.delete(key)
+  async delete(key: string): Promise<boolean>
+  async delete(keys: string[]): Promise<number>
+  async delete(keyOrKeys: string | string[]): Promise<boolean | number> {
+    if (typeof keyOrKeys === 'string') return this.values.delete(keyOrKeys)
+    let deleted = 0
+    for (const key of keyOrKeys) if (this.values.delete(key)) deleted += 1
+    return deleted
   }
 
   async list<T>(options: { prefix?: string } = {}): Promise<Map<string, T>> {
@@ -296,6 +310,67 @@ test(
   },
   60_000,
 )
+
+test(
+  'a persistent compaction failure fails closed before duplicate set-like traffic can grow the WAL',
+  async () => {
+    const storage = new FakeStorage()
+    const floor = openFloor(storage, { CARPET_NETWORK: 'mock', CARPET_LOG_MODE: 'compact' })
+    await answer<MarketFacts>(await call(floor, '/market/facts'))
+    storage.failPointer = true
+
+    const watcher = (await keyPairFromSeed('40'.repeat(32), 0)).address
+    for (let index = 0; index < 7; index += 1) {
+      expect(
+        await answer<{ watching: boolean }>(
+          await call(floor, '/market/watch', { address: watcher }),
+        ),
+      ).toEqual({ watching: true })
+    }
+
+    const raw = [...storage.values.keys()].filter((key) => key.startsWith('event:v1:'))
+    expect(raw).toHaveLength(8)
+    const keysAtFailure = [...storage.values.keys()]
+    const sequenceAtFailure = storage.values.get('meta:event-sequence:v1')
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const refused = await call(floor, '/market/watch', { address: watcher })
+      expect(refused.status).toBe(507)
+      expect((await refused.json()) as { error: string }).toMatchObject({
+        error: expect.stringMatching(/could not compact/i),
+      })
+    }
+    expect([...storage.values.keys()]).toEqual(keysAtFailure)
+    expect(storage.values.get('meta:event-sequence:v1')).toBe(sequenceAtFailure)
+    expect([...storage.values.keys()].filter((key) => key.startsWith('event:v1:'))).toEqual(raw)
+
+    // Eviction/restart retries compaction but never reopens mutation admission
+    // while the same persistent storage failure remains.
+    const reopened = openFloor(storage, { CARPET_NETWORK: 'mock', CARPET_LOG_MODE: 'compact' })
+    await answer<MarketFacts>(await call(reopened, '/market/facts'))
+    const keysAfterReopen = [...storage.values.keys()]
+    const refusedAfterReopen = await call(reopened, '/market/watch', { address: watcher })
+    expect(refusedAfterReopen.status).toBe(507)
+    expect((await refusedAfterReopen.json()) as { error: string }).toMatchObject({
+      error: expect.stringMatching(/could not compact/i),
+    })
+    expect([...storage.values.keys()]).toEqual(keysAfterReopen)
+    expect(storage.values.get('meta:event-sequence:v1')).toBe(sequenceAtFailure)
+    expect([...storage.values.keys()].filter((key) => key.startsWith('event:v1:'))).toEqual(raw)
+  },
+  60_000,
+)
+
+test('an unknown durable-log mode refuses traffic before writing mock authority', async () => {
+  const storage = new FakeStorage()
+  const floor = openFloor(storage, { CARPET_NETWORK: 'mock', CARPET_LOG_MODE: 'compcat' })
+  const response = await call(floor, '/market/facts')
+  expect(response.status).toBe(500)
+  expect((await response.json()) as { error: string }).toMatchObject({
+    error: expect.stringMatching(/CARPET_LOG_MODE must be "compat" or "compact"/),
+  })
+  expect(storage.values.size).toBe(0)
+})
 
 test('the actual Floor still refuses mainnet before writing durable demo state', async () => {
   const storage = new FakeStorage()

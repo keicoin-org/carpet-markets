@@ -12,7 +12,9 @@ overhead, folds only state with proven set/bounded-tail semantics, and gives the
 log a hard admission bound once compaction is explicitly enabled. It cannot
 collapse the signed block history into a constant-size ledger state. When that
 canonical bound is reached, reads continue and a mutation is refused before its
-pending WAL row is written.
+pending WAL row is written. An exact retry of an already accepted signed
+`process` body is the exception: the ledger returns the prior hash without
+allocating another sequence or WAL row.
 
 ## Measured envelope and limits
 
@@ -44,14 +46,19 @@ The policy is deliberately below the platform's storage ceiling:
 - cold replay target: at most 60 seconds in the pinned runtime workload.
 
 In `compact` mode both replay dimensions apply to the canonical accepted
-authority, after safe watch/reply folding. Raw legacy duplicates and a removable
-pending WAL row therefore cannot brick boot. There is no silent truncation. An
-over-limit compact-mode mutation gets HTTP 507 and says that the ledger did not
-accept it; an oversized request gets HTTP 413 before a durable row is written in
-either mode. The limits are small because the deterministic bootstrap already
-owns most of the cold-start budget. Raising them requires a new runtime
-measurement or a supported `MockLedger` state import, not only more Durable
-Object storage.
+authority, after safe exact-process/watch/reply folding. Raw legacy duplicates
+and a removable pending WAL row therefore cannot brick boot. The raw tail is
+bounded independently by fail-closed compaction: the event that reaches the
+8-event checkpoint threshold remains accepted in v1 authority, but if generation
+verification, pointer activation, or cleanup fails, later new mutations get HTTP
+507 without allocating a sequence or row. An exact accepted `process` retry
+remains available because it needs no new authority. There is no silent
+truncation. An over-limit compact-mode mutation likewise gets HTTP 507 and says
+that the ledger did not accept it; an oversized request gets HTTP 413 before a
+durable row is written in either mode. The limits are small because the
+deterministic bootstrap already owns most of the cold-start budget. Raising them
+requires a new runtime measurement or a supported `MockLedger` state import,
+not only more Durable Object storage.
 
 ## Storage protocol
 
@@ -71,8 +78,9 @@ Checkpoint-aware versions additionally use:
 
 The compaction sequence is:
 
-1. Canonicalise only duplicate `watch` inputs and replies older than the
-   existing 100-per-asset thread tail. Never rewrite seed, RPC, or launch order.
+1. Canonicalise byte-identical accepted signed `process` retries, duplicate
+   `watch` inputs, and replies older than the existing 100-per-asset thread
+   tail. Never rewrite distinct RPC, seed, or launch order.
 2. Write immutable chunks and their manifest as an inactive generation.
 3. Read every chunk back and verify count, bytes, registry identity, and digest.
 4. Atomically switch the one pointer, retaining the old active manifest as the
@@ -89,7 +97,9 @@ that tail and retain the existing accept-or-delete replay behavior.
 ## Two-release rollout and rollback floor
 
 `wrangler.jsonc` intentionally ships `CARPET_LOG_MODE="compat"`. Do not change
-that in the first deployment.
+that in the first deployment. The only accepted values are exact `compat` and
+`compact`; a missing value defaults to `compat`, while any other value refuses
+traffic before writing mock authority.
 
 1. Deploy the checkpoint-aware code in `compat`. It reads v1 and v2, preserves
    ordinary user mutations in the existing v1 WAL, applies only the 4 KiB input
@@ -121,6 +131,9 @@ on replay time approaching 60 seconds, either replay bound approaching 80%, any
 `compaction` record with `ok:false`, or `recoveredFrom` being non-null. Records
 include event count/bytes by kind, accepted bytes for the request and trailing
 minute, tail count, checkpoint generation, replay time, and all active limits.
+After a failed compaction, preserve the object and repair the cause; new
+mutations deliberately remain fail-closed until a later cold boot can complete a
+checkpoint successfully.
 
 ## Recovery and reset
 

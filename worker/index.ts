@@ -26,6 +26,7 @@ import {
   eventKey,
   loadLog,
   logSize,
+  processInputIdentity,
   readBoundedText,
   replayLimitError,
   writeCheckpoint,
@@ -65,6 +66,7 @@ export class Floor extends DurableObject<Env> {
   #acceptedWindow: { at: number; bytes: number }[] = []
   #replaying = true
   #authorityBlocked: ReplayLimitError | undefined
+  #compactionBlocked: ReplayLimitError | undefined
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
@@ -77,6 +79,12 @@ export class Floor extends DurableObject<Env> {
 
   #ready(): Promise<{ registry: Registry; chain: ChainSource }> {
     this.#booting ??= (async () => {
+      const logMode = this.env.CARPET_LOG_MODE ?? 'compat'
+      if (logMode !== 'compat' && logMode !== 'compact') {
+        throw new Error(
+          `CARPET_LOG_MODE must be "compat" or "compact"; received ${JSON.stringify(logMode)}. No mock ledger traffic was accepted.`,
+        )
+      }
       const bootStarted = Date.now()
       const chain = await openChain({
         network: this.env.CARPET_NETWORK,
@@ -343,6 +351,7 @@ export class Floor extends DurableObject<Env> {
       this.#history = canonicalEvents(this.#history)
       this.#tailEvents = 0
       this.#authorityBlocked = undefined
+      this.#compactionBlocked = undefined
       this.#observe('compaction', {
         ok: true,
         compactionMs: Date.now() - started,
@@ -351,6 +360,11 @@ export class Floor extends DurableObject<Env> {
         after: this.#measure(),
       })
     } catch (error) {
+      this.#compactionBlocked = new ReplayLimitError(
+        `The mock market could not compact its durable replay tail: ${
+          error instanceof Error ? error.message : String(error)
+        }. No further ledger mutation was accepted; preserve the named Durable Object and repair compaction before retrying.`,
+      )
       this.#observe('compaction', {
         ok: false,
         compactionMs: Date.now() - started,
@@ -391,8 +405,22 @@ export class Floor extends DurableObject<Env> {
     state: { registry: Registry; chain: ChainSource },
   ): Promise<Response> {
     return this.#mutations.run(async () => {
-      if (this.env.CARPET_LOG_MODE === 'compact' && this.#authorityBlocked) {
-        return json({ error: this.#authorityBlocked.message }, this.#authorityBlocked.status)
+      const retry = acceptedProcessRetry(input, this.#history)
+      if (retry) {
+        try {
+          const response = await this.#apply(retry, state)
+          this.#observe('idempotent-retry', {
+            sequence: retry.sequence,
+            ...this.#measure(),
+          })
+          return response instanceof Response ? response : json(response)
+        } finally {
+          this.#now = Date.now()
+        }
+      }
+      if (this.env.CARPET_LOG_MODE === 'compact') {
+        const blocked = this.#compactionBlocked ?? this.#authorityBlocked
+        if (blocked) return json({ error: blocked.message }, blocked.status)
       }
       // Write-ahead is what makes a crash between receipt and application safe.
       // Failed mock blocks are atomic in MockLedger; quote/reply validation runs
@@ -462,6 +490,21 @@ class Queue {
     this.#tail = next.catch(() => undefined)
     return next
   }
+}
+
+function acceptedProcessRetry(
+  input: EventInput,
+  history: readonly StoredEvent[],
+): StoredEvent | undefined {
+  if (input.kind !== 'rpc') return undefined
+  const identity = processInputIdentity(input.body)
+  if (identity === undefined) return undefined
+  return history.find(
+    (event) =>
+      event.status === 'accepted' &&
+      event.kind === 'rpc' &&
+      processInputIdentity(event.body) === identity,
+  )
 }
 
 export default {

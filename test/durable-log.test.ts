@@ -84,7 +84,7 @@ async function storeLegacy(storage: MemoryStorage, events: StoredEvent[]): Promi
 }
 
 describe('durable replay checkpoints', () => {
-  test('canonicalisation only folds set-like watches and the bounded reply tail', () => {
+  test('canonicalisation folds exact process retries, set-like watches, and the bounded reply tail', () => {
     const events: StoredEvent[] = [seed(), watch(1), watch(2)]
     for (let sequence = 3; sequence < 108; sequence += 1) {
       events.push({
@@ -108,13 +108,32 @@ describe('durable replay checkpoints', () => {
       status: 'accepted',
       kind: 'rpc',
       at: 108,
-      body: '{"action":"process"}',
+      body: '{"action":"process","block":{"hash":"same"}}',
+    })
+    events.push({
+      version: 1,
+      sequence: 109,
+      status: 'accepted',
+      kind: 'rpc',
+      at: 109,
+      body: '{"action":"process","block":{"hash":"same"}}',
+    })
+    events.push({
+      version: 1,
+      sequence: 110,
+      status: 'accepted',
+      kind: 'rpc',
+      at: 110,
+      body: '{"action":"process","block":{"hash":"different"}}',
     })
 
     const compacted = canonicalEvents(events)
     expect(compacted.filter((event) => event.kind === 'watch').map((event) => event.sequence)).toEqual([1])
     expect(compacted.filter((event) => event.kind === 'reply')).toHaveLength(100)
-    expect(compacted.some((event) => event.kind === 'rpc')).toBe(true)
+    expect(compacted.filter((event) => event.kind === 'rpc').map((event) => event.sequence)).toEqual([
+      108,
+      110,
+    ])
   })
 
   test('keeps a verified predecessor and v1 tail for active-checkpoint recovery', async () => {

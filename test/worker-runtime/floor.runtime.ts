@@ -1,24 +1,23 @@
 import { env } from 'cloudflare:workers'
 import { evictDurableObject, runInDurableObject } from 'cloudflare:test'
-import { keyPairFromSeed, signHash } from '@keicoin/core'
+import { keyPairFromSeed, signHash, type AccountInfo, type Block } from '@keicoin/core'
 import { Kei } from 'kei-transaction'
 import { expect, test } from 'vitest'
 
 import type { Floor } from '../../worker/index.js'
+import {
+  CHECKPOINT_POINTERS,
+  EVENT_PREFIX,
+  NEXT_SEQUENCE,
+  eventKey,
+  loadLog,
+  type StoredEvent,
+} from '../../worker/durable-log.js'
 import type { Book, Holder, MarketFacts } from '../../shared/listing.js'
 import { cleanReply, replyHash, type Reply } from '../../shared/social.js'
 import { answer, call, nodeFor } from './helpers.js'
 
 const BUYER_SEED = '29'.repeat(32)
-const EVENT_PREFIX = 'event:v1:'
-const NEXT_SEQUENCE = 'meta:event-sequence:v1'
-const CHECKPOINT_POINTERS = 'meta:checkpoint:v2'
-
-interface StoredEvent {
-  kind: string
-  sequence: number
-  status: 'pending' | 'accepted'
-}
 
 interface CheckpointPointers {
   active: { generation: number; throughSequence: number }
@@ -70,6 +69,39 @@ async function snapshot(stub: DurableObjectStub<Floor>, asset: string): Promise<
     await call(stub, '/market/activity?limit=50'),
   )
   return { address: facts.address, listings: facts.listings, book, holders, replies, activity }
+}
+
+interface LedgerSnapshot {
+  account: AccountInfo | null
+  history: Block[]
+  block: Block | null
+}
+
+async function ledgerSnapshot(
+  stub: DurableObjectStub<Floor>,
+  account: string,
+  hash: string,
+): Promise<LedgerSnapshot> {
+  const [{ account: info }, { history }, { block }] = await Promise.all([
+    answer<{ account: AccountInfo | null }>(
+      await call(stub, '/rpc', { action: 'account_info', account }),
+    ),
+    answer<{ history: Block[] }>(
+      await call(stub, '/rpc', { action: 'account_history', account, count: 100, shape: 'block' }),
+    ),
+    answer<{ block: Block | null }>(await call(stub, '/rpc', { action: 'block_info', hash })),
+  ])
+  return { account: info, history, block }
+}
+
+function callBody(stub: DurableObjectStub<Floor>, path: string, body: string): Promise<Response> {
+  return stub.fetch(
+    new Request(`https://example.test/examples/carpet-markets${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    }),
+  )
 }
 
 test('the configured FLOOR persists the seeded market, first trade, discovery, and reply across real eviction', async () => {
@@ -189,62 +221,207 @@ test('the configured FLOOR persists the seeded market, first trade, discovery, a
   }
 })
 
-test('the real runtime migrates v1, compacts atomically, evicts, and recovers from a damaged active generation', async () => {
+test('the real runtime serializes overlapping checkpoints and replays an idempotent signed retry', async () => {
   const stub = env.FLOOR.get(env.FLOOR.idFromName('compaction-migration'))
   const initial = await answer<MarketFacts>(await call(stub, '/market/facts'))
+  const asset = initial.listings.find((listing) => listing.symbol === 'FRINGE')?.asset
+  expect(asset).toBeDefined()
 
-  // The seed plus 15 accepted writes crosses the 8-event threshold twice.
-  // Unique watches preserve observable registry discovery while duplicate-watch
-  // folding is covered independently by the deterministic unit tests.
-  for (let index = 0; index < 15; index += 1) {
-    await answer(await call(stub, '/market/watch', { address: `kei_runtime_compaction_${index}` }))
+  const processCalls: { body: string; hash: string }[] = []
+  const recordingFloor = {
+    async fetch(request: Request): Promise<Response> {
+      const body = request.method === 'POST' ? await request.clone().text() : ''
+      let action: unknown
+      try {
+        action = (JSON.parse(body) as { action?: unknown }).action
+      } catch {
+        action = undefined
+      }
+      const response = await stub.fetch(request)
+      if (action === 'process' && response.ok) {
+        const result = await response.clone().json<{ hash?: string }>()
+        if (result.hash) processCalls.push({ body, hash: result.hash })
+      }
+      return response
+    },
   }
-
-  const before = await answer<MarketFacts>(await call(stub, '/market/facts'))
-  const pointers = await runInDurableObject<Floor, CheckpointPointers>(stub, async (_instance, state) => {
-    const value = await state.storage.get<CheckpointPointers>(CHECKPOINT_POINTERS)
-    expect(value?.active.generation).toBe(2)
-    expect(value?.previous?.generation).toBe(1)
-    const v1 = await state.storage.list<StoredEvent>({ prefix: EVENT_PREFIX })
-    expect([...v1.values()].every((event) => event.sequence > value!.previous!.throughSequence)).toBe(true)
-    return value!
+  const buyer = await Kei.server({
+    seed: '31'.repeat(32),
+    node: nodeFor(recordingFloor),
+    network: 'mock',
   })
 
-  const beforeLimit = await eventLog(stub)
-  const sequenceBeforeLimit = await runInDurableObject<Floor, number>(stub, async (_instance, state) =>
-    state.storage.get<number>(NEXT_SEQUENCE).then((value) => value ?? -1),
-  )
-  const refused = await call(stub, '/market/watch', { address: 'kei_over_the_measured_replay_bound' })
-  expect(refused.status).toBe(507)
-  expect(await refused.json<{ error: string }>()).toMatchObject({
-    error: expect.stringMatching(/No ledger mutation was accepted/i),
-  })
-  expect(await eventLog(stub)).toEqual(beforeLimit)
-  await runInDurableObject<Floor, void>(stub, async (_instance, state) => {
-    expect(await state.storage.get<number>(NEXT_SEQUENCE)).toBe(sequenceBeforeLimit)
-  })
+  try {
+    await buyer.faucet(50)
+    await buyer.sync()
+    expect(processCalls).toHaveLength(1)
+    const original = processCalls[0]!
 
-  await evictDurableObject(stub)
-  const afterEviction = await answer<MarketFacts>(await call(stub, '/market/facts'))
-  expect(afterEviction.address).toBe(initial.address)
-  expect(afterEviction.listings.map((listing) => listing.asset)).toEqual(
-    before.listings.map((listing) => listing.asset),
-  )
+    const beforeRetryLedger = await ledgerSnapshot(stub, buyer.address, original.hash)
+    const beforeRetryMarket = await snapshot(stub, asset!)
+    expect(beforeRetryLedger.account?.balance).toBe('50000000000000000000')
+    expect(beforeRetryLedger.history).toHaveLength(1)
 
-  // Corrupt only the active immutable generation. The predecessor plus its v1
-  // tail is still complete and must be selected on the next genuine cold boot.
-  await runInDurableObject<Floor, void>(stub, async (_instance, state) => {
-    const prefix = `checkpoint:v2:${pointers.active.generation.toString().padStart(8, '0')}:chunk:`
-    const chunks = await state.storage.list({ prefix })
-    const first = [...chunks.keys()][0]
-    expect(first).toBeDefined()
-    await state.storage.delete(first!)
-  })
-  await evictDurableObject(stub)
+    const beforeRetryAuthority = await runInDurableObject<Floor, StoredEvent[]>(
+      stub,
+      async (_instance, state) => (await loadLog(state.storage)).events,
+    )
+    expect(
+      beforeRetryAuthority.filter((event) => event.kind === 'rpc' && event.body === original.body),
+    ).toHaveLength(1)
 
-  const recovered = await answer<MarketFacts>(await call(stub, '/market/facts'))
-  expect(recovered.address).toBe(initial.address)
-  expect(recovered.listings.map((listing) => listing.asset)).toEqual(
-    before.listings.map((listing) => listing.asset),
-  )
+    // A rejected process consumes its assigned sequence but leaves no WAL row.
+    // The gap must remain harmless when later overlapping writes compact it.
+    const rejectedSequence = await runInDurableObject<Floor, number>(stub, async (_instance, state) =>
+      state.storage.get<number>(NEXT_SEQUENCE).then((value) => value ?? -1),
+    )
+    const rejected = await call(stub, '/rpc', { action: 'process', block: {} })
+    expect(await rejected.json<{ error?: string }>()).toHaveProperty('error')
+    await runInDurableObject<Floor, void>(stub, async (_instance, state) => {
+      expect(await state.storage.get(eventKey(rejectedSequence))).toBeUndefined()
+      expect(await state.storage.get<number>(NEXT_SEQUENCE)).toBe(rejectedSequence + 1)
+    })
+    const firstConcurrentSequence = rejectedSequence + 1
+
+    // Seed + faucet + the original receive are three accepted events. These
+    // fourteen requests really overlap in workerd and carry the authority
+    // across both the 8-event and 16-event checkpoint boundaries.
+    const watchAddresses = await Promise.all(
+      Array.from({ length: 13 }, (_, index) =>
+        keyPairFromSeed((0x40 + index).toString(16).repeat(32), 0).then((keys) => keys.address),
+      ),
+    )
+    const concurrent = await Promise.all([
+      callBody(stub, '/rpc', original.body),
+      ...watchAddresses.map((address) => call(stub, '/market/watch', { address })),
+    ])
+    expect(concurrent).toHaveLength(14)
+    for (const response of concurrent) expect(response.status).toBe(200)
+    expect(await concurrent[0]!.json<{ hash: string }>()).toEqual({ hash: original.hash })
+    for (const response of concurrent.slice(1)) {
+      expect(await response.json<{ watching: boolean }>()).toEqual({ watching: true })
+    }
+
+    // The retry is acknowledged with the same hash but allocates no second WAL
+    // row or sequence and applies no second ledger transition.
+    expect(await ledgerSnapshot(stub, buyer.address, original.hash)).toEqual(beforeRetryLedger)
+    expect(durableView(await snapshot(stub, asset!))).toEqual(durableView(beforeRetryMarket))
+
+    const proof = await runInDurableObject<
+      Floor,
+      {
+        pointers: CheckpointPointers
+        authority: StoredEvent[]
+        v1Tail: StoredEvent[]
+        nextSequence: number
+        tailEvents: number
+      }
+    >(stub, async (_instance, state) => {
+      const pointers = await state.storage.get<CheckpointPointers>(CHECKPOINT_POINTERS)
+      expect(pointers).toBeDefined()
+      const loaded = await loadLog(state.storage)
+      const v1 = await state.storage.list<StoredEvent>({ prefix: EVENT_PREFIX })
+      return {
+        pointers: pointers!,
+        authority: loaded.events,
+        v1Tail: [...v1.values()].sort((left, right) => left.sequence - right.sequence),
+        nextSequence: (await state.storage.get<number>(NEXT_SEQUENCE)) ?? -1,
+        tailEvents: loaded.tailEvents,
+      }
+    })
+
+    expect(proof.pointers.active.generation).toBe(2)
+    expect(proof.pointers.previous?.generation).toBe(1)
+    expect(proof.pointers.previous!.throughSequence).toBeLessThan(
+      proof.pointers.active.throughSequence,
+    )
+    expect(proof.tailEvents).toBe(0)
+    expect(proof.authority).toHaveLength(16)
+    const sequences = proof.authority.map((event) => event.sequence)
+    expect(sequences).toEqual([...sequences].sort((left, right) => left - right))
+    expect(new Set(sequences).size).toBe(sequences.length)
+    expect(sequences).not.toContain(rejectedSequence)
+    expect(proof.authority.every((event) => event.status === 'accepted')).toBe(true)
+    expect(proof.pointers.active.throughSequence).toBe(sequences.at(-1))
+    expect(proof.nextSequence).toBe(firstConcurrentSequence + watchAddresses.length)
+    expect(proof.v1Tail.map((event) => event.sequence)).toEqual(
+      sequences.filter((sequence) => sequence > proof.pointers.previous!.throughSequence),
+    )
+    expect(proof.v1Tail.every((event) => event.status === 'accepted')).toBe(true)
+    const retried = proof.authority.filter(
+      (event) => event.kind === 'rpc' && event.body === original.body,
+    )
+    expect(retried).toEqual(
+      beforeRetryAuthority.filter((event) => event.kind === 'rpc' && event.body === original.body),
+    )
+    expect(proof.authority.filter((event) => event.kind === 'watch')).toHaveLength(
+      watchAddresses.length,
+    )
+    expect(
+      proof.authority
+        .filter((event) => event.kind === 'watch')
+        .map((event) => event.sequence),
+    ).toEqual(
+      Array.from({ length: watchAddresses.length }, (_, index) => firstConcurrentSequence + index),
+    )
+    for (const address of watchAddresses) {
+      expect(
+        proof.authority.filter((event) => event.kind === 'watch' && event.address === address),
+      ).toHaveLength(1)
+    }
+
+    // Even at the measured authority ceiling, the same signed process remains
+    // idempotently successful and consumes neither a sequence nor another row.
+    const beforeLimit = await eventLog(stub)
+    const sequenceBeforeLimit = proof.nextSequence
+    const retryAtLimit = await callBody(stub, '/rpc', original.body)
+    expect(retryAtLimit.status).toBe(200)
+    expect(await retryAtLimit.json<{ hash: string }>()).toEqual({ hash: original.hash })
+    expect(await eventLog(stub)).toEqual(beforeLimit)
+    await runInDurableObject<Floor, void>(stub, async (_instance, state) => {
+      expect(await state.storage.get<number>(NEXT_SEQUENCE)).toBe(sequenceBeforeLimit)
+      expect((await loadLog(state.storage)).events).toEqual(proof.authority)
+    })
+
+    // A genuinely new seventeenth authority event is refused before allocating
+    // a sequence or WAL row. Compaction must not turn that hard limit into loss.
+    const refused = await call(stub, '/market/watch', {
+      address: 'kei_over_the_measured_replay_bound',
+    })
+    expect(refused.status).toBe(507)
+    expect(await refused.json<{ error: string }>()).toMatchObject({
+      error: expect.stringMatching(/No ledger mutation was accepted/i),
+    })
+    expect(await eventLog(stub)).toEqual(beforeLimit)
+    await runInDurableObject<Floor, void>(stub, async (_instance, state) => {
+      expect(await state.storage.get<number>(NEXT_SEQUENCE)).toBe(sequenceBeforeLimit)
+    })
+
+    await evictDurableObject(stub)
+    expect(await ledgerSnapshot(stub, buyer.address, original.hash)).toEqual(beforeRetryLedger)
+    expect(durableView(await snapshot(stub, asset!))).toEqual(durableView(beforeRetryMarket))
+    const replayedAuthority = await runInDurableObject<Floor, StoredEvent[]>(
+      stub,
+      async (_instance, state) => (await loadLog(state.storage)).events,
+    )
+    expect(replayedAuthority).toEqual(proof.authority)
+
+    // Corrupt only the active immutable generation. The predecessor plus its
+    // surviving v1 tail is still complete and must recover on a second cold boot.
+    await runInDurableObject<Floor, void>(stub, async (_instance, state) => {
+      const prefix = `checkpoint:v2:${proof.pointers.active.generation
+        .toString()
+        .padStart(8, '0')}:chunk:`
+      const chunks = await state.storage.list({ prefix })
+      const first = [...chunks.keys()][0]
+      expect(first).toBeDefined()
+      await state.storage.delete(first!)
+    })
+    await evictDurableObject(stub)
+
+    expect(await ledgerSnapshot(stub, buyer.address, original.hash)).toEqual(beforeRetryLedger)
+    expect(durableView(await snapshot(stub, asset!))).toEqual(durableView(beforeRetryMarket))
+  } finally {
+    buyer.close()
+  }
 })

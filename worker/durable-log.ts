@@ -134,17 +134,22 @@ export function replayLimitError(
 }
 
 /**
- * Only discard inputs whose final semantics are explicitly bounded/set-like.
- * Ledger RPC and launch ordering are never rewritten.
+ * Only discard inputs with explicitly idempotent or bounded/set-like semantics.
+ * Distinct ledger RPC and launch ordering are never rewritten.
  */
 export function canonicalEvents(events: readonly StoredEvent[]): StoredEvent[] {
   const accepted = events.filter((event) => event.status === 'accepted')
   const firstWatch = new Map<string, number>()
+  const firstProcess = new Map<string, number>()
   const keptReplies = new Set<number>()
   const replies = new Map<string, StoredEvent[]>()
 
   for (const event of accepted) {
     if (event.kind === 'watch' && !firstWatch.has(event.address)) firstWatch.set(event.address, event.sequence)
+    if (event.kind === 'rpc') {
+      const process = processInputIdentity(event.body)
+      if (process !== undefined && !firstProcess.has(process)) firstProcess.set(process, event.sequence)
+    }
     if (event.kind === 'reply') {
       const thread = replies.get(event.body.asset) ?? []
       thread.push(event)
@@ -160,9 +165,25 @@ export function canonicalEvents(events: readonly StoredEvent[]): StoredEvent[] {
 
   return accepted.filter((event) => {
     if (event.kind === 'watch') return firstWatch.get(event.address) === event.sequence
+    if (event.kind === 'rpc') {
+      const process = processInputIdentity(event.body)
+      if (process !== undefined) return firstProcess.get(process) === event.sequence
+    }
     if (event.kind === 'reply') return keptReplies.has(event.sequence)
     return true
   })
+}
+
+/** Exact accepted process bodies are ledger-idempotent and need one authority row. */
+export function processInputIdentity(body: string): string | undefined {
+  try {
+    const input = JSON.parse(body) as { action?: unknown; block?: unknown }
+    return input.action === 'process' && input.block !== null && typeof input.block === 'object'
+      ? body
+      : undefined
+  } catch {
+    return undefined
+  }
 }
 
 export async function loadLog(storage: LogStorage): Promise<LoadedLog> {
