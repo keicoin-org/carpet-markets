@@ -20,6 +20,8 @@ import {
 
 class MemoryStorage implements LogStorage {
   readonly values = new Map<string, unknown>()
+  readonly singleGets: string[] = []
+  readonly multiGetSizes: number[] = []
   failPointer = false
   failDelete = false
   failCheckpointDelete = false
@@ -29,7 +31,11 @@ class MemoryStorage implements LogStorage {
   async get<T>(key: string): Promise<T | undefined>
   async get<T>(keys: string[]): Promise<Map<string, T>>
   async get<T>(keyOrKeys: string | string[]): Promise<T | undefined | Map<string, T>> {
-    if (typeof keyOrKeys === 'string') return structuredClone(this.values.get(keyOrKeys)) as T | undefined
+    if (typeof keyOrKeys === 'string') {
+      this.singleGets.push(keyOrKeys)
+      return structuredClone(this.values.get(keyOrKeys)) as T | undefined
+    }
+    this.multiGetSizes.push(keyOrKeys.length)
     const found = new Map<string, T>()
     for (const key of keyOrKeys) {
       if (this.values.has(key)) found.set(key, structuredClone(this.values.get(key)) as T)
@@ -345,5 +351,114 @@ describe('durable replay checkpoints', () => {
       }),
     })
     await expect(readBoundedText(request, 8)).rejects.toMatchObject({ status: 413 })
+  })
+
+  test('hostile pointer manifests fall back before computed checkpoint reads or allocations', async () => {
+    const base = {
+      version: 2,
+      generation: 1,
+      throughSequence: 0,
+      chunkCount: 1,
+      eventCount: 1,
+      eventBytes: 1,
+      digest: '0'.repeat(64),
+      registryAddress: 'kei_registry',
+      createdAt: 1,
+    }
+    const corruptions: Record<string, unknown>[] = [
+      { generation: Number.NaN },
+      { generation: Number.MAX_SAFE_INTEGER + 1 },
+      { throughSequence: -1 },
+      { throughSequence: Number.POSITIVE_INFINITY },
+      { chunkCount: 0 },
+      { chunkCount: 1.5 },
+      { chunkCount: Number.MAX_SAFE_INTEGER },
+      { eventCount: 0 },
+      { eventCount: Number.NaN },
+      { eventCount: LOG_LIMITS.replayEvents + 1 },
+      { eventBytes: 0 },
+      { eventBytes: Number.POSITIVE_INFINITY },
+      { eventBytes: LOG_LIMITS.replayBytes + 1 },
+      { digest: 'not-a-sha256-digest' },
+      { registryAddress: 'x'.repeat(129) },
+      { createdAt: Number.NaN },
+      { createdAt: 1.5 },
+      { unexpected: 'unversioned metadata' },
+      { eventCount: 2, throughSequence: 0 },
+      { eventCount: 2, eventBytes: 1, throughSequence: 1 },
+    ]
+
+    for (const corruption of corruptions) {
+      const storage = new MemoryStorage()
+      await storeLegacy(storage, [seed()])
+      storage.values.set(CHECKPOINT_POINTERS, { version: 2, active: { ...base, ...corruption } })
+      storage.singleGets.length = 0
+
+      const recovered = await loadLog(storage)
+      expect(recovered).toMatchObject({ events: [seed()], recoveredFrom: 'legacy' })
+      expect(storage.singleGets).toEqual([CHECKPOINT_POINTERS])
+      expect(storage.multiGetSizes).toEqual([])
+    }
+  })
+
+  test('hostile stored manifest metadata is rejected before chunk-key allocation', async () => {
+    const storage = new MemoryStorage()
+    const events = [seed()]
+    await storeLegacy(storage, events)
+    const manifest = await writeCheckpoint(storage, events, undefined)
+    storage.values.set(`checkpoint:v2:${manifest.generation.toString().padStart(8, '0')}:manifest`, {
+      ...manifest,
+      chunkCount: Number.MAX_SAFE_INTEGER,
+    })
+    storage.singleGets.length = 0
+    storage.multiGetSizes.length = 0
+
+    const recovered = await loadLog(storage)
+    expect(recovered).toMatchObject({ events, recoveredFrom: 'legacy' })
+    expect(storage.singleGets).toHaveLength(2)
+    expect(storage.singleGets[0]).toBe(CHECKPOINT_POINTERS)
+    expect(storage.singleGets[1]).toMatch(/^checkpoint:v2:.*:manifest$/)
+    expect(storage.multiGetSizes).toEqual([])
+  })
+
+  test('an invalid active manifest still recovers through its verified predecessor', async () => {
+    const storage = new MemoryStorage()
+    const events = [seed()]
+    await storeLegacy(storage, events)
+    const previous = await writeCheckpoint(storage, events, undefined)
+    storage.values.set(CHECKPOINT_POINTERS, {
+      version: 2,
+      active: { ...previous, generation: 2, chunkCount: Number.MAX_SAFE_INTEGER },
+      previous,
+    })
+    storage.singleGets.length = 0
+    storage.multiGetSizes.length = 0
+
+    const recovered = await loadLog(storage)
+    expect(recovered).toMatchObject({ events, checkpoint: previous, recoveredFrom: 'previous' })
+    expect(storage.singleGets.filter((key) => key.startsWith('checkpoint:v2:'))).toHaveLength(1)
+    expect(storage.multiGetSizes).toEqual([1])
+  })
+
+  test('unbounded checkpoint metadata fails closed without a legacy recovery path', async () => {
+    const storage = new MemoryStorage()
+    storage.values.set(CHECKPOINT_POINTERS, {
+      version: 2,
+      active: {
+        version: 2,
+        generation: 1,
+        throughSequence: 0,
+        chunkCount: Number.MAX_SAFE_INTEGER,
+        eventCount: 1,
+        eventBytes: 1,
+        digest: '0'.repeat(64),
+        registryAddress: 'kei_registry',
+        createdAt: 1,
+      },
+    })
+
+    await expect(loadLog(storage)).rejects.toThrow(/failed verification.*point-in-time recovery/i)
+    expect(storage.singleGets).toEqual([CHECKPOINT_POINTERS])
+    expect(storage.multiGetSizes).toEqual([])
   })
 })

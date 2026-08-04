@@ -1,9 +1,20 @@
 import { expect, mock, test } from 'bun:test'
-import { HttpNode, keyPairFromSeed, signHash } from '@keicoin/core'
+import {
+  HttpNode,
+  ZERO_HASH,
+  generateWork,
+  hashBlock,
+  keyPairFromSeed,
+  signHash,
+  tierFor,
+  workRoot,
+  type Block,
+  type BlockBody,
+} from '@keicoin/core'
 import { Kei } from 'kei-transaction'
 
 import { cleanReply, replyHash } from '../shared/social.js'
-import { LOG_LIMITS, rawLimitError } from '../worker/durable-log.js'
+import { LOG_LIMITS, eventKey, rawLimitError } from '../worker/durable-log.js'
 import type { Book, Holder, MarketFacts } from '../shared/listing.js'
 import type { Reply } from '../shared/social.js'
 
@@ -31,6 +42,8 @@ class FakeStorage {
   readonly values = new Map<string, unknown>()
   failPointer = false
   failAcceptedPut = false
+  silentAcceptedPut = false
+  failPendingDelete = false
   /**
    * Fail exactly the step that can only fail after a checkpoint pointer is
    * already authoritative: deleting the v1 rows the retained predecessor
@@ -68,13 +81,31 @@ class FakeStorage {
       this.failAcceptedPut = false
       throw new Error('simulated accepted-status write failure')
     }
+    if (
+      this.silentAcceptedPut &&
+      Object.entries(entries).some(
+        ([key, entry]) =>
+          key.startsWith('event:v1:') &&
+          typeof entry === 'object' &&
+          entry !== null &&
+          (entry as { status?: unknown }).status === 'accepted',
+      )
+    ) {
+      this.silentAcceptedPut = false
+      return
+    }
     for (const [key, entry] of Object.entries(entries)) this.values.set(key, structuredClone(entry))
   }
 
   async delete(key: string): Promise<boolean>
   async delete(keys: string[]): Promise<number>
   async delete(keyOrKeys: string | string[]): Promise<boolean | number> {
-    if (typeof keyOrKeys === 'string') return this.values.delete(keyOrKeys)
+    if (typeof keyOrKeys === 'string') {
+      if (this.failPendingDelete && keyOrKeys.startsWith('event:v1:')) {
+        throw new Error('simulated rejected-pending cleanup failure')
+      }
+      return this.values.delete(keyOrKeys)
+    }
     if (this.failCoveredCleanup && keyOrKeys.some((key) => key.startsWith('event:v1:'))) {
       throw new Error('simulated post-activation cleanup failure')
     }
@@ -141,6 +172,23 @@ function nodeFor(floor: FloorLike, posted?: string[]): HttpNode {
       return floor.fetch(request)
     }) as typeof fetch,
   })
+}
+
+async function signedBlock(node: HttpNode, body: BlockBody, privateKey: string): Promise<Block> {
+  const thresholds = await node.workThresholds()
+  return {
+    ...body,
+    work: generateWork(workRoot(body), BigInt(thresholds[tierFor(body)])),
+    signature: await signHash(privateKey, hashBlock(body)),
+  }
+}
+
+async function ledgerView(node: HttpNode, address: string) {
+  return {
+    account: await node.accountInfo(address),
+    receivables: await node.receivables(address),
+    history: await node.accountHistory(address, { limit: 100 }),
+  }
 }
 
 function postBody(floor: FloorLike, body: string): Promise<Response> {
@@ -304,6 +352,176 @@ test(
 )
 
 test(
+  'signed late-validation refusals preserve live receivables and the next accepted mutation across restart',
+  async () => {
+    const storage = new FakeStorage()
+    const floor = openFloor(storage)
+    await answer<MarketFacts>(await call(floor, '/market/facts'))
+    const node = nodeFor(floor)
+
+    const invalidBalanceRecipient = await keyPairFromSeed('46'.repeat(32), 0)
+    const invalidBalanceSend = await node.faucet(invalidBalanceRecipient.address, '100')
+    const beforeInvalidBalance = await ledgerView(node, invalidBalanceRecipient.address)
+    expect(beforeInvalidBalance).toMatchObject({
+      account: null,
+      receivables: [{ hash: invalidBalanceSend.hash, amount: '100' }],
+      history: [],
+    })
+    const balanceSequence = storage.values.get('meta:event-sequence:v1') as number
+    const rowsBeforeInvalidBalance = eventRows(storage)
+    const invalidOpen = await signedBlock(
+      node,
+      {
+        type: 'state',
+        subtype: 'open',
+        account: invalidBalanceRecipient.address,
+        previous: ZERO_HASH,
+        representative: invalidBalanceRecipient.address,
+        balance: '101',
+        link: invalidBalanceSend.hash,
+      },
+      invalidBalanceRecipient.privateKey,
+    )
+
+    storage.failPendingDelete = true
+    const invalidBalanceRequest = call(floor, '/rpc', { action: 'process', block: invalidOpen })
+    // Start a same-instance read while the rejected process owns the mutation
+    // queue. It must resolve against the accepted-history replacement, never
+    // the authority whose late refusal already consumed this receivable.
+    const concurrentView = ledgerView(node, invalidBalanceRecipient.address)
+    const invalidBalanceResponse = await invalidBalanceRequest
+    expect(invalidBalanceResponse.status).toBe(503)
+    expect((await invalidBalanceResponse.json()) as { error: string }).toMatchObject({
+      error: expect.stringMatching(/pending WAL row was preserved.*cold restart/i),
+    })
+    expect(await concurrentView).toEqual(beforeInvalidBalance)
+    expect(await ledgerView(node, invalidBalanceRecipient.address)).toEqual(beforeInvalidBalance)
+    expect(eventRows(storage)).toEqual([...rowsBeforeInvalidBalance, eventKey(balanceSequence)])
+    expect(storage.values.get(eventKey(balanceSequence))).toMatchObject({ status: 'pending' })
+    expect(storage.values.get('meta:event-sequence:v1')).toBe(balanceSequence + 1)
+
+    // The disposable serving authority was rebuilt, but failed WAL cleanup still
+    // latches this live object closed. A fresh boot re-evaluates the pending row
+    // in isolation and deletes it only after another clean rebuild succeeds.
+    const blockedKeys = [...storage.values.keys()]
+    const blockedRetry = await call(floor, '/rpc', { action: 'process', block: invalidOpen })
+    expect(blockedRetry.status).toBe(503)
+    expect([...storage.values.keys()]).toEqual(blockedKeys)
+    storage.failPendingDelete = false
+    const recoveredFloor = openFloor(storage)
+    const recoveredNode = nodeFor(recoveredFloor)
+    expect(await ledgerView(recoveredNode, invalidBalanceRecipient.address)).toEqual(beforeInvalidBalance)
+    expect(eventRows(storage)).toEqual(rowsBeforeInvalidBalance)
+    expect(storage.values.has(eventKey(balanceSequence))).toBe(false)
+
+    const validOpen = await signedBlock(
+      recoveredNode,
+      {
+        type: 'state',
+        subtype: 'open',
+        account: invalidBalanceRecipient.address,
+        previous: ZERO_HASH,
+        representative: invalidBalanceRecipient.address,
+        balance: '100',
+        link: invalidBalanceSend.hash,
+      },
+      invalidBalanceRecipient.privateKey,
+    )
+    const validOpenResult = await answer<{ hash: string }>(
+      await call(recoveredFloor, '/rpc', { action: 'process', block: validOpen }),
+    )
+    expect(validOpenResult).toEqual({ hash: hashBlock(validOpen) })
+    expect(storage.values.get(eventKey(balanceSequence + 1))).toMatchObject({
+      kind: 'rpc',
+      status: 'accepted',
+    })
+    expect(storage.values.get('meta:event-sequence:v1')).toBe(balanceSequence + 2)
+    expect(await ledgerView(recoveredNode, invalidBalanceRecipient.address)).toMatchObject({
+      account: { balance: '100', receivableCount: 0 },
+      receivables: [],
+    })
+    const rowsAfterValidOpen = eventRows(storage)
+    const sequenceAfterValidOpen = storage.values.get('meta:event-sequence:v1')
+    expect(
+      await answer<{ hash: string }>(
+        await call(recoveredFloor, '/rpc', { action: 'process', block: validOpen }),
+      ),
+    ).toEqual(validOpenResult)
+    expect(eventRows(storage)).toEqual(rowsAfterValidOpen)
+    expect(storage.values.get('meta:event-sequence:v1')).toBe(sequenceAfterValidOpen)
+
+    const wrongTypeRecipient = await keyPairFromSeed('47'.repeat(32), 0)
+    const wrongTypeSend = await recoveredNode.faucet(wrongTypeRecipient.address, '77')
+    const beforeWrongType = await ledgerView(recoveredNode, wrongTypeRecipient.address)
+    const wrongTypeSequence = storage.values.get('meta:event-sequence:v1') as number
+    const rowsBeforeWrongType = eventRows(storage)
+    const wrongTypeReceive = await signedBlock(
+      recoveredNode,
+      {
+        type: 'asset',
+        account: wrongTypeRecipient.address,
+        previous: ZERO_HASH,
+        representative: wrongTypeRecipient.address,
+        balance: '0',
+        op: { kind: 'asset_receive', link: wrongTypeSend.hash },
+      },
+      wrongTypeRecipient.privateKey,
+    )
+
+    const wrongTypeResponse = await call(recoveredFloor, '/rpc', {
+      action: 'process',
+      block: wrongTypeReceive,
+    })
+    expect((await wrongTypeResponse.json()) as { error: string }).toMatchObject({
+      error: expect.stringMatching(/Incoming Kei is collected by a receive block/i),
+    })
+    expect(await ledgerView(recoveredNode, wrongTypeRecipient.address)).toEqual(beforeWrongType)
+    expect(eventRows(storage)).toEqual(rowsBeforeWrongType)
+    expect(storage.values.has(eventKey(wrongTypeSequence))).toBe(false)
+    expect(storage.values.get('meta:event-sequence:v1')).toBe(wrongTypeSequence + 1)
+
+    const correctSecondOpen = await signedBlock(
+      recoveredNode,
+      {
+        type: 'state',
+        subtype: 'open',
+        account: wrongTypeRecipient.address,
+        previous: ZERO_HASH,
+        representative: wrongTypeRecipient.address,
+        balance: '77',
+        link: wrongTypeSend.hash,
+      },
+      wrongTypeRecipient.privateKey,
+    )
+    await answer<{ hash: string }>(
+      await call(recoveredFloor, '/rpc', { action: 'process', block: correctSecondOpen }),
+    )
+    expect(storage.values.get(eventKey(wrongTypeSequence + 1))).toMatchObject({
+      kind: 'rpc',
+      status: 'accepted',
+    })
+    expect(storage.values.get('meta:event-sequence:v1')).toBe(wrongTypeSequence + 2)
+
+    const live = {
+      invalidBalance: await ledgerView(recoveredNode, invalidBalanceRecipient.address),
+      wrongType: await ledgerView(recoveredNode, wrongTypeRecipient.address),
+      rows: eventRows(storage),
+      sequence: storage.values.get('meta:event-sequence:v1'),
+    }
+    const reopened = openFloor(storage)
+    const replayedNode = nodeFor(reopened)
+    const replayed = {
+      invalidBalance: await ledgerView(replayedNode, invalidBalanceRecipient.address),
+      wrongType: await ledgerView(replayedNode, wrongTypeRecipient.address),
+      rows: eventRows(storage),
+      sequence: storage.values.get('meta:event-sequence:v1'),
+    }
+    expect(replayed).toEqual(live)
+  },
+  90_000,
+)
+
+test(
   'cold replay removes a pending rejected mutation left by a crash before cleanup',
   async () => {
     const storage = new FakeStorage()
@@ -350,7 +568,7 @@ test(
     const sequence = storage.values.get('meta:event-sequence:v1') as number
     const pendingKey = `event:v1:${sequence.toString().padStart(12, '0')}`
 
-    storage.failAcceptedPut = true
+    storage.silentAcceptedPut = true
     const failed = await call(floor, '/market/reply', reply)
     expect(failed.status).toBe(503)
     expect((await failed.json()) as { error: string }).toMatchObject({

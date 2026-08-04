@@ -90,7 +90,11 @@ The compaction sequence is:
    the ledger already holds with a different envelope is explicitly refused
    before WAL admission. Never rewrite distinct RPC, seed, or launch order.
 2. Write immutable chunks and their manifest as an inactive generation.
-3. Read every chunk back and verify count, bytes, registry identity, and digest.
+3. Validate every manifest field against the replay schema and its hard chunk
+   bound before deriving chunk keys, then read every chunk back and verify count,
+   bytes, registry identity, and digest. Corrupt active metadata falls back to a
+   separately verified predecessor or the complete v1 seed log without making
+   an attacker-sized key allocation or multi-key read.
 4. Atomically switch the one pointer, retaining the old active manifest as the
    predecessor.
 5. Delete only v1 rows covered by that retained predecessor, then remove
@@ -105,13 +109,19 @@ later fail verification, boot uses the previous checkpoint plus the surviving
 v1 tail and skips cleanup. Pending WAL events remain in that tail and retain the
 existing accept-or-delete replay behavior.
 
-Application and WAL acceptance are also separate failure boundaries. Once an
-application succeeds, failure to rewrite its row from `pending` to `accepted`
-never deletes that row: the already-mutated live instance refuses further new
-mutations with HTTP 503, while reads and exact retries of previously accepted
-signed blocks remain available. A cold instance rebuilds disposable state,
-applies the retained pending row once, and completes its acceptance write. Only
-an application failure known to be atomic may delete its pending row.
+Application and WAL acceptance are also separate failure boundaries. The Floor
+normally holds one serving authority. If pinned `MockLedger` returns a late
+refusal after consuming a receivable, that authority is removed from service and
+closed, and accepted durable history is replayed into a fresh replacement before
+the rejected pending row may be deleted. Mock reads share the mutation queue, so
+they see the replacement or HTTP 503, never the rejected side effect. Failure to
+rebuild or to verify deletion preserves the pending row and latches new mutations
+until recovery. Boot replay uses the same rebuild-before-delete order and returns
+only a fresh accepted-history authority (or no authority) if cleanup remains
+unresolved. Once application succeeds, failure to rewrite its row from `pending`
+to `accepted` also never deletes that row: reads remain available, the applied
+instance refuses further new mutations with HTTP 503, and a later cold instance
+applies the retained pending row once before completing acceptance.
 
 ## Two-release rollout and rollback floor
 

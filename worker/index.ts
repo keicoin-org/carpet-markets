@@ -53,6 +53,17 @@ interface Env {
   /** Two-release migration gate: `compat` first, then explicitly `compact`. */
   CARPET_LOG_MODE?: string
 }
+
+interface Authority {
+  registry: Registry
+  chain: ChainSource
+  threads: Threads
+}
+
+interface AuthorityState {
+  current?: Authority
+}
+
 const MOUNT = '/examples/carpet-markets'
 
 function apiPath(url: URL): string | null {
@@ -61,10 +72,10 @@ function apiPath(url: URL): string | null {
 }
 
 export class Floor extends DurableObject<Env> {
-  #booting: Promise<{ registry: Registry; chain: ChainSource }> | undefined
+  #booting: Promise<AuthorityState> | undefined
   #now = Date.now()
-  #threads = new Threads(() => this.#now)
   readonly #stored: Promise<Awaited<ReturnType<typeof loadLog>>>
+  #storedConsumed = false
   readonly #mutations = new Queue()
   #history: StoredEvent[] = []
   #tailEvents = 0
@@ -86,7 +97,7 @@ export class Floor extends DurableObject<Env> {
     })
   }
 
-  #ready(): Promise<{ registry: Registry; chain: ChainSource }> {
+  #ready(): Promise<AuthorityState> {
     this.#booting ??= (async () => {
       const logMode = this.env.CARPET_LOG_MODE ?? 'compat'
       if (logMode !== 'compat' && logMode !== 'compact') {
@@ -95,40 +106,23 @@ export class Floor extends DurableObject<Env> {
         )
       }
       const bootStarted = Date.now()
-      const chain = await openChain({
-        network: this.env.CARPET_NETWORK,
-        node: this.env.CARPET_NODE,
-        durable: true,
-      })
+      const authority = await this.#openAuthority()
+      const state: AuthorityState = { current: authority }
+      const { chain, registry } = authority
 
       // Testnet is somebody else's persistent chain. It remains a pass-through;
       // local DO storage must not be presented as authority for remote state.
       if (chain.sdkNetwork !== 'mock') {
-        const registry = await startRegistry({
-          seed: this.env.CARPET_SEED ?? randomSeed(),
-          node: chain.node,
-          network: chain.sdkNetwork,
-          chain: chain.facts,
-          replyCount: (asset) => this.#threads.count(asset),
-        })
-        return { registry, chain }
+        return state
       }
 
-      const loaded = await this.#stored
+      const loaded = await this.#loadStored()
+      // Re-entering #ready means the prior authority never became available.
+      // Rebuild every disposable/latching field from the freshly loaded WAL.
+      this.#acceptanceBlocked = undefined
       const stored = loaded.events
       this.#checkpoint = loaded.checkpoint
       this.#tailEvents = loaded.tailEvents
-      const registrySeed = this.env.CARPET_SEED ?? DEMO_REGISTRY_SEED
-      const registry = await startRegistry({
-        seed: registrySeed,
-        node: chain.node,
-        network: chain.sdkNetwork,
-        chain: chain.facts,
-        replyCount: (asset) => this.#threads.count(asset),
-        now: () => this.#now,
-      })
-      const state = { registry, chain }
-
       const seedEvent = stored.find(
         (event): event is StoredEvent & { kind: 'seed'; registryAddress: string } => event.kind === 'seed',
       )
@@ -146,41 +140,85 @@ export class Floor extends DurableObject<Env> {
       if (stored.length === 0) {
         const seeded = await this.#append({ kind: 'seed', registryAddress: registry.address, at: Date.now() })
         if ('refusal' in seeded) throw seeded.refusal
+        let applied = false
         try {
-          await this.#apply(seeded.event, state)
-          await this.#accept(seeded.event)
+          await this.#apply(seeded.event, authority)
+          applied = true
         } catch (error) {
-          await this.ctx.storage.delete(seeded.key)
-          registry.close()
+          // Replace any partially seeded cache, then prove the rejected row is
+          // gone before boot can expose the empty accepted history.
+          try {
+            await this.#replaceAuthority(state)
+            await this.#deletePending(seeded.key)
+          } finally {
+            state.current?.registry.close()
+          }
           throw error
+        }
+        if (applied) {
+          try {
+            await this.#accept(seeded.event)
+          } catch (error) {
+            // The complete demo seed is readable; its pending row is the one
+            // cold-recovery path, so preserve both and latch new mutations.
+            this.#blockAcceptanceFailure(error)
+          }
         }
       } else {
         try {
           for (const event of stored) {
+            if (event.status === 'accepted') {
+              const response = await this.#apply(event, this.#requireAuthority(state))
+              const failure = response instanceof Response ? await responseFailure(response) : undefined
+              if (failure) {
+                throw new Error(`Persisted ${event.kind} event ${event.sequence} failed replay: ${failure}`)
+              }
+              this.#history.push(event)
+              continue
+            }
+            let response: Response | unknown
             try {
-              const response = await this.#apply(event, state)
-              if (response instanceof Response) {
-                const failure = await responseFailure(response)
-                if (failure) {
-                  if (event.status === 'pending') {
-                    await this.ctx.storage.delete(eventKey(event.sequence))
-                    continue
-                  }
-                  throw new Error(`Persisted ${event.kind} event ${event.sequence} failed replay: ${failure}`)
-                }
-              }
-              if (event.status === 'pending') await this.#accept(event)
-              else this.#history.push(event)
+              response = await this.#apply(event, this.#requireAuthority(state))
             } catch (error) {
-              if (event.status === 'pending' && expectedRejection(error)) {
-                await this.ctx.storage.delete(eventKey(event.sequence))
-                continue
+              try {
+                await this.#replaceAuthority(state)
+              } catch (rebuildError) {
+                this.#blockUnresolvedAuthority(state, rebuildError)
+                break
               }
-              throw error
+              if (!expectedRejection(error)) {
+                this.#blockUnresolvedAuthority(state, error)
+                break
+              }
+              try {
+                await this.#deletePending(eventKey(event.sequence))
+              } catch (cleanupError) {
+                this.#blockUnresolvedAuthority(state, cleanupError)
+                break
+              }
+              continue
+            }
+            if (response instanceof Response && (await responseFailure(response))) {
+              try {
+                await this.#replaceAuthority(state)
+                await this.#deletePending(eventKey(event.sequence))
+              } catch (error) {
+                this.#blockUnresolvedAuthority(state, error)
+                break
+              }
+              continue
+            }
+            try {
+              await this.#accept(event)
+            } catch (error) {
+              // The pending event is already applied to this fresh instance.
+              // Preserve it and the readable authority, but admit nothing else.
+              this.#blockAcceptanceFailure(error)
+              break
             }
           }
         } catch (error) {
-          registry.close()
+          state.current?.registry.close()
           throw error
         }
       }
@@ -198,7 +236,7 @@ export class Floor extends DurableObject<Env> {
         checkpointGeneration: this.#checkpoint?.generation ?? null,
         recoveredFrom: loaded.recoveredFrom ?? null,
         mode: this.env.CARPET_LOG_MODE ?? 'compat',
-        admissionBlocked: this.#authorityBlocked?.message ?? null,
+        admissionBlocked: this.#acceptanceBlockMessage() ?? this.#authorityBlocked?.message ?? null,
         ...this.#measure(),
       })
       // Cleanup is the one compaction step that can fail after its pointer is
@@ -209,10 +247,122 @@ export class Floor extends DurableObject<Env> {
       // The explicit phase-2 configuration can migrate an oversized raw v1 log
       // whose canonical accepted authority is still inside the measured bound.
       // Compatibility mode never reaches this write/delete path.
-      await this.#compactAndReclaim()
+      if (!this.#acceptanceBlocked) await this.#compactAndReclaim()
       return state
     })()
     return this.#booting
+  }
+
+  async #openAuthority(): Promise<Authority> {
+    const chain = await openChain({
+      network: this.env.CARPET_NETWORK,
+      node: this.env.CARPET_NODE,
+      durable: true,
+    })
+    const threads = new Threads(() => this.#now)
+    const registry = await startRegistry({
+      seed:
+        this.env.CARPET_SEED ??
+        (chain.sdkNetwork === 'mock' ? DEMO_REGISTRY_SEED : randomSeed()),
+      node: chain.node,
+      network: chain.sdkNetwork,
+      chain: chain.facts,
+      replyCount: (asset) => threads.count(asset),
+      ...(chain.sdkNetwork === 'mock' ? { now: () => this.#now } : {}),
+    })
+    return { registry, chain, threads }
+  }
+
+  async #loadStored(): Promise<Awaited<ReturnType<typeof loadLog>>> {
+    if (!this.#storedConsumed) {
+      this.#storedConsumed = true
+      return this.#stored
+    }
+    return loadLog(this.ctx.storage)
+  }
+
+  #requireAuthority(state: AuthorityState): Authority {
+    if (!state.current) {
+      throw new ReplayLimitError(
+        'The mock market is rebuilding its disposable ledger authority after a rejected mutation.',
+        503,
+      )
+    }
+    return state.current
+  }
+
+  /** Build one serving authority from accepted durable history only. */
+  async #replayedAuthority(): Promise<Authority> {
+    const replacement = await this.#openAuthority()
+    try {
+      for (const event of this.#history) {
+        const result = await this.#apply(event, replacement)
+        const failure = result instanceof Response ? await responseFailure(result) : undefined
+        if (failure) {
+          throw new Error(`accepted ${event.kind} event ${event.sequence} was rejected: ${failure}`)
+        }
+      }
+    } catch (error) {
+      replacement.registry.close()
+      throw error
+    }
+    return replacement
+  }
+
+  /**
+   * Stop serving the possibly tainted cache before any asynchronous replay.
+   * A concurrent read therefore sees 503, never rejected side effects.
+   */
+  async #replaceAuthority(state: AuthorityState): Promise<void> {
+    const tainted = state.current
+    state.current = undefined
+    try {
+      state.current = await this.#replayedAuthority()
+    } finally {
+      tainted?.registry.close()
+    }
+  }
+
+  #discardAuthority(state: AuthorityState): void {
+    state.current?.registry.close()
+    state.current = undefined
+  }
+
+  /** A rejected row is gone only after storage proves it is gone. */
+  async #deletePending(key: string): Promise<void> {
+    await this.ctx.storage.delete(key)
+    if ((await this.ctx.storage.get(key)) !== undefined) {
+      throw new Error(`Durable WAL cleanup left rejected pending row ${key} in storage.`)
+    }
+  }
+
+  #blockUnresolvedAuthority(state: AuthorityState, error: unknown): ReplayLimitError {
+    const readState = state.current
+      ? 'A freshly replayed accepted ledger remains readable.'
+      : 'No possibly tainted ledger is being served.'
+    const blocked = new ReplayLimitError(
+      `The mock market could not safely resolve a rejected pending mutation: ${
+        error instanceof Error ? error.message : String(error)
+      }. The pending WAL row was preserved and all new mutations are blocked until a cold restart reconciles it. ${readState}`,
+      503,
+    )
+    this.#acceptanceBlocked = blocked
+    return blocked
+  }
+
+  #blockAcceptanceFailure(error: unknown): ReplayLimitError {
+    const blocked = new ReplayLimitError(
+      `The mock market applied a mutation but could not mark its durable WAL row accepted: ${
+        error instanceof Error ? error.message : String(error)
+      }. The pending row was preserved; retry after a cold restart can recover it exactly once.`,
+      503,
+    )
+    this.#acceptanceBlocked = blocked
+    return blocked
+  }
+
+  #acceptanceBlockMessage(): string | undefined {
+    return this.#acceptanceBlocked?.message
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -220,20 +370,24 @@ export class Floor extends DurableObject<Env> {
     const path = apiPath(url)
     if (!path) return new Response('Not found', { status: 404 })
 
-    let registry: Registry
-    let chain: ChainSource
+    let state: AuthorityState
     try {
-      ;({ registry, chain } = await this.#ready())
+      state = await this.#ready()
     } catch (error) {
       this.#booting = undefined
-      // A failed replay may have populated part of an in-memory thread cache.
-      // The durable log remains authoritative, so a retry starts that cache over.
-      this.#threads = new Threads(() => this.#now)
       this.#history = []
       this.#replaying = true
       const message = error instanceof Error ? error.message : String(error)
       return json({ error: message }, error instanceof NetworkRefused ? 503 : 500)
     }
+    let authority: Authority
+    try {
+      authority = this.#requireAuthority(state)
+    } catch (error) {
+      const message = this.#acceptanceBlocked?.message ?? (error instanceof Error ? error.message : String(error))
+      return json({ error: message }, 503)
+    }
+    const { registry, chain, threads } = authority
 
     if (path === '/rpc') {
       if (chain.sdkNetwork !== 'mock') return chain.rpc(request)
@@ -248,11 +402,17 @@ export class Floor extends DurableObject<Env> {
       try {
         action = (JSON.parse(body) as { action?: unknown }).action
       } catch {
-        return chain.rpc(rebuiltRequest(request, body))
+        return this.#mutations.run(() =>
+          this.#requireAuthority(state).chain.rpc(rebuiltRequest(request, body)),
+        )
       }
-      if (action !== 'process' && action !== 'faucet') return chain.rpc(rebuiltRequest(request, body))
+      if (action !== 'process' && action !== 'faucet') {
+        return this.#mutations.run(() =>
+          this.#requireAuthority(state).chain.rpc(rebuiltRequest(request, body)),
+        )
+      }
       try {
-        return await this.#mutate({ kind: 'rpc', body, at: Date.now() }, { registry, chain })
+        return await this.#mutate({ kind: 'rpc', body, at: Date.now() }, state)
       } catch (error) {
         return json(
           { error: error instanceof Error ? error.message : String(error) },
@@ -264,27 +424,39 @@ export class Floor extends DurableObject<Env> {
     try {
       switch (path) {
         case '/market/facts':
-          return json(await registry.facts())
+          return this.#mutations.run(async () => json(await this.#requireAuthority(state).registry.facts()))
         case '/market/book':
-          return json(await registry.book(url.searchParams.get('asset') ?? ''))
+          return this.#mutations.run(async () =>
+            json(await this.#requireAuthority(state).registry.book(url.searchParams.get('asset') ?? '')),
+          )
         case '/market/holders':
-          return json({ holders: await registry.holders(url.searchParams.get('asset') ?? '') })
+          return this.#mutations.run(async () =>
+            json({ holders: await this.#requireAuthority(state).registry.holders(url.searchParams.get('asset') ?? '') }),
+          )
         case '/market/activity': {
           const asked = Number(url.searchParams.get('limit') ?? 24)
-          return json({ trades: await registry.activity(Number.isFinite(asked) ? asked : 24) })
+          return this.#mutations.run(async () =>
+            json({
+              trades: await this.#requireAuthority(state).registry.activity(Number.isFinite(asked) ? asked : 24),
+            }),
+          )
         }
         case '/market/replies':
-          return json({ replies: this.#threads.list(url.searchParams.get('asset') ?? '') })
+          return this.#mutations.run(async () =>
+            json({ replies: this.#requireAuthority(state).threads.list(url.searchParams.get('asset') ?? '') }),
+          )
         case '/market/reply': {
           const body = await read<PostReply>(request)
-          if (!registry.listing(body.asset)) throw new ListingError('That coin is not listed here.')
-          if (chain.sdkNetwork !== 'mock') return json(await this.#threads.add(body))
-          return this.#mutate({ kind: 'reply', body, at: Date.now() }, { registry, chain })
+          if (chain.sdkNetwork !== 'mock') {
+            if (!registry.listing(body.asset)) throw new ListingError('That coin is not listed here.')
+            return json(await threads.add(body))
+          }
+          return this.#mutate({ kind: 'reply', body, at: Date.now() }, state)
         }
         case '/market/launch': {
           const body = await read<{ address: string } & Record<string, unknown>>(request)
           if (chain.sdkNetwork !== 'mock') return json(await registry.quoteLaunch(body.address, body))
-          return this.#mutate({ kind: 'launch', body, at: Date.now() }, { registry, chain })
+          return this.#mutate({ kind: 'launch', body, at: Date.now() }, state)
         }
         case '/market/watch': {
           const { address } = await read<{ address: string }>(request)
@@ -292,7 +464,7 @@ export class Floor extends DurableObject<Env> {
             registry.watch(address)
             return json({ watching: true })
           }
-          return this.#mutate({ kind: 'watch', address, at: Date.now() }, { registry, chain })
+          return this.#mutate({ kind: 'watch', address, at: Date.now() }, state)
         }
         default:
           return new Response('Not found', { status: 404 })
@@ -349,7 +521,12 @@ export class Floor extends DurableObject<Env> {
 
   async #accept(event: StoredEvent): Promise<void> {
     const accepted = { ...event, status: 'accepted' as const }
-    await this.ctx.storage.put(eventKey(event.sequence), accepted)
+    const key = eventKey(event.sequence)
+    await this.ctx.storage.put(key, accepted)
+    const persisted = await this.ctx.storage.get<StoredEvent>(key)
+    if (JSON.stringify(persisted) !== JSON.stringify(accepted)) {
+      throw new Error(`Durable WAL row ${key} did not retain its accepted status.`)
+    }
     this.#history.push(accepted)
     this.#authorityBlocked = replayLimitError(canonicalEvents(this.#history))
     this.#tailEvents += 1
@@ -368,7 +545,7 @@ export class Floor extends DurableObject<Env> {
       kind: accepted.kind,
       acceptedBytes: bytes,
       acceptedBytesLastMinute: this.#acceptedWindow.reduce((total, entry) => total + entry.bytes, 0),
-      storageOperations: 2,
+      storageOperations: 3,
       storageKeyWrites: 3,
       // Compact-mode admission reads the persisted v1 prefix once before it
       // allocates anything, so raw pressure is storage's answer, not memory's.
@@ -534,14 +711,26 @@ export class Floor extends DurableObject<Env> {
 
   async #mutate(
     input: EventInput,
-    state: { registry: Registry; chain: ChainSource },
+    state: AuthorityState,
   ): Promise<Response> {
     return this.#mutations.run(async () => {
       const process = acceptedProcessMatch(input, this.#history)
       if (process?.kind === 'retry') {
         const retry = process.event
         try {
-          const response = await this.#apply(retry, state)
+          let response: Response | unknown
+          try {
+            response = await this.#apply(retry, this.#requireAuthority(state))
+          } catch (error) {
+            this.#discardAuthority(state)
+            this.#acceptanceBlocked = new ReplayLimitError(
+              `The mock market could not read its accepted signed retry safely: ${
+                error instanceof Error ? error.message : String(error)
+              }. Its accepted WAL row was preserved, no possibly tainted ledger is being served, and all new mutations are blocked until a cold restart.`,
+              503,
+            )
+            return json({ error: this.#acceptanceBlocked.message }, this.#acceptanceBlocked.status)
+          }
           this.#observe('idempotent-retry', {
             sequence: retry.sequence,
             ...this.#measure(),
@@ -573,26 +762,46 @@ export class Floor extends DurableObject<Env> {
         return json({ error: this.#acceptanceBlocked.message }, this.#acceptanceBlocked.status)
       }
       // Write-ahead is what makes a crash between receipt and application safe.
-      // Failed mock blocks are atomic in MockLedger; quote/reply validation runs
-      // before their cache writes. Those failures can therefore remove their
-      // event without leaving accepted state that a cold replay would omit.
+      // The dependency has no transaction or snapshot API. The ordinary path
+      // applies once; a rejection discards that cache and replays accepted
+      // durable history before its pending row may be removed or reads resume.
       const stored = await this.#append(input)
       if ('refusal' in stored) return json({ error: stored.refusal.message }, stored.refusal.status)
       try {
         let response: Response | unknown
         try {
-          response = await this.#apply(stored.event, state)
+          response = await this.#apply(stored.event, this.#requireAuthority(state))
         } catch (error) {
-          // Every application exception is raised before the corresponding mock
-          // ledger/thread mutation commits. Only that proven-atomic failure may
-          // remove its WAL row.
-          await this.ctx.storage.delete(stored.key)
+          try {
+            await this.#replaceAuthority(state)
+          } catch (rebuildError) {
+            const blocked = this.#blockUnresolvedAuthority(state, rebuildError)
+            return json({ error: blocked.message }, blocked.status)
+          }
+          if (!expectedRejection(error)) {
+            const blocked = this.#blockUnresolvedAuthority(state, error)
+            return json({ error: blocked.message }, blocked.status)
+          }
+          try {
+            await this.#deletePending(stored.key)
+          } catch (cleanupError) {
+            const blocked = this.#blockUnresolvedAuthority(state, cleanupError)
+            return json({ error: blocked.message }, blocked.status)
+          }
           this.#discardRaw(stored.event)
           throw error
         }
         if (response instanceof Response && (await responseFailure(response))) {
-          // MockLedger returns its rejected response atomically, before mutation.
-          await this.ctx.storage.delete(stored.key)
+          // The response may be late: pinned MockLedger 0.3.0 consumes a
+          // receivable before returning some balance/type refusals. Stop serving
+          // it, replay accepted history, then prove the rejected WAL row is gone.
+          try {
+            await this.#replaceAuthority(state)
+            await this.#deletePending(stored.key)
+          } catch (error) {
+            const blocked = this.#blockUnresolvedAuthority(state, error)
+            return json({ error: blocked.message }, blocked.status)
+          }
           this.#discardRaw(stored.event)
           return response
         }
@@ -603,13 +812,8 @@ export class Floor extends DurableObject<Env> {
           // that lets a fresh instance reproduce and accept this mutation once.
           // Never delete it, and never let this already-mutated instance apply a
           // retry or any later mutation on top of unresolved authority.
-          this.#acceptanceBlocked = new ReplayLimitError(
-            `The mock market applied a mutation but could not mark its durable WAL row accepted: ${
-              error instanceof Error ? error.message : String(error)
-            }. The pending row was preserved; retry after a cold restart can recover it exactly once.`,
-            503,
-          )
-          return json({ error: this.#acceptanceBlocked.message }, this.#acceptanceBlocked.status)
+          const blocked = this.#blockAcceptanceFailure(error)
+          return json({ error: blocked.message }, blocked.status)
         }
         return response instanceof Response ? response : json(response)
       } finally {
@@ -620,7 +824,7 @@ export class Floor extends DurableObject<Env> {
 
   async #apply(
     event: StoredEvent,
-    state: { registry: Registry; chain: ChainSource },
+    state: Authority,
   ): Promise<Response | unknown> {
     this.#now = event.at
     switch (event.kind) {
@@ -628,7 +832,7 @@ export class Floor extends DurableObject<Env> {
         await seedDemo({
           node: state.chain.node as KeiNode,
           registry: state.registry,
-          threads: this.#threads,
+          threads: state.threads,
           now: event.at,
         })
         return { seeded: true }
@@ -650,7 +854,7 @@ export class Floor extends DurableObject<Env> {
         return { watching: true }
       case 'reply':
         if (!state.registry.listing(event.body.asset)) throw new ListingError('That coin is not listed here.')
-        return this.#threads.add(event.body)
+        return state.threads.add(event.body)
     }
   }
 }

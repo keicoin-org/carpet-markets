@@ -68,6 +68,13 @@ export const NEXT_SEQUENCE = 'meta:event-sequence:v1'
 export const CHECKPOINT_POINTERS = 'meta:checkpoint:v2'
 const CHECKPOINT_PREFIX = 'checkpoint:v2:'
 const CHUNK_TARGET_BYTES = 128 * 1024
+// A checkpoint is admitted only inside the replay bounds. Account for JSON
+// array punctuation as well as event bytes to derive the most chunks the
+// writer can legitimately produce. Validate this before constructing keys.
+const MAX_CHECKPOINT_CHUNKS =
+  LOG_LIMITS.replayBytes + LOG_LIMITS.replayEvents + 1 <= CHUNK_TARGET_BYTES
+    ? 1
+    : LOG_LIMITS.replayEvents
 const REPLIES_PER_ASSET = 100
 
 export interface CheckpointManifest {
@@ -273,27 +280,29 @@ export function processBlockIdentity(body: string): string | undefined {
 export async function loadLog(storage: LogStorage): Promise<LoadedLog> {
   const legacy = await storage.list<StoredEvent>({ prefix: EVENT_PREFIX })
   const legacyEvents = sortEvents([...legacy.values()])
-  const pointers = await storage.get<CheckpointPointers>(CHECKPOINT_POINTERS)
-  if (!pointers || pointers.version !== 2) return { events: legacyEvents, tailEvents: legacyEvents.length }
+  const storedPointers = await storage.get<unknown>(CHECKPOINT_POINTERS)
+  if (storedPointers === undefined) return { events: legacyEvents, tailEvents: legacyEvents.length }
+  const pointers = checkpointPointerEnvelope(storedPointers)
+  if (!pointers) return recoverLegacyOrThrow(legacyEvents)
 
   const active = await readCheckpoint(storage, pointers.active)
   if (active) {
-    const tail = legacyEvents.filter((event) => event.sequence > pointers.active.throughSequence)
+    const tail = legacyEvents.filter((event) => event.sequence > active.manifest.throughSequence)
     return {
-      events: mergeEvents(active, tail),
+      events: mergeEvents(active.events, tail),
       tailEvents: tail.length,
-      checkpoint: pointers.active,
+      checkpoint: active.manifest,
     }
   }
 
-  if (pointers.previous) {
+  if (pointers.previous !== undefined) {
     const previous = await readCheckpoint(storage, pointers.previous)
     if (previous) {
-      const tail = legacyEvents.filter((event) => event.sequence > pointers.previous!.throughSequence)
+      const tail = legacyEvents.filter((event) => event.sequence > previous.manifest.throughSequence)
       return {
-        events: mergeEvents(previous, tail),
+        events: mergeEvents(previous.events, tail),
         tailEvents: tail.length,
-        checkpoint: pointers.previous,
+        checkpoint: previous.manifest,
         recoveredFrom: 'previous',
       }
     }
@@ -301,12 +310,7 @@ export async function loadLog(storage: LogStorage): Promise<LoadedLog> {
 
   // First-generation compaction deliberately retains the complete legacy log,
   // which is the last safe fallback if both checkpoint pointers are unreadable.
-  if (legacyEvents.some((event) => event.kind === 'seed')) {
-    return { events: legacyEvents, tailEvents: legacyEvents.length, recoveredFrom: 'legacy' }
-  }
-  throw new Error(
-    'The active and previous mock checkpoints failed verification and no complete v1 seed log remains. Restore the named Durable Object with point-in-time recovery; do not reset it.',
-  )
+  return recoverLegacyOrThrow(legacyEvents)
 }
 
 export async function writeCheckpoint(
@@ -317,13 +321,18 @@ export async function writeCheckpoint(
   const compacted = canonicalEvents(events)
   assertWithinReplayLimits(compacted)
   const registryAddress = seedAddress(compacted)
-  const oldPointers = await storage.get<CheckpointPointers>(CHECKPOINT_POINTERS)
-  const generation =
-    Math.max(
-      current?.generation ?? 0,
-      oldPointers?.active.generation ?? 0,
-      oldPointers?.previous?.generation ?? 0,
-    ) + 1
+  const storedPointers = await storage.get<unknown>(CHECKPOINT_POINTERS)
+  const oldPointers = checkpointPointerEnvelope(storedPointers)
+  const knownGenerations = [current?.generation]
+  const oldActive = checkpointManifest(oldPointers?.active)
+  const oldPrevious = checkpointManifest(oldPointers?.previous)
+  if (oldActive) knownGenerations.push(oldActive.generation)
+  if (oldPrevious) knownGenerations.push(oldPrevious.generation)
+  const priorGeneration = Math.max(...knownGenerations.map((generation) => generation ?? 0))
+  if (priorGeneration >= Number.MAX_SAFE_INTEGER) {
+    throw new Error('The checkpoint generation counter is exhausted; preserve the Durable Object for migration.')
+  }
+  const generation = priorGeneration + 1
   const serialized = JSON.stringify(compacted)
   const digest = await sha256(serialized)
   const chunks = chunkEvents(compacted)
@@ -401,14 +410,26 @@ export type ReclaimOutcome =
  * exactly one, which is the one thing compaction must never do.
  */
 export async function reclaimCoveredRows(storage: LogStorage): Promise<ReclaimOutcome> {
-  const pointers = await storage.get<CheckpointPointers>(CHECKPOINT_POINTERS)
-  if (!pointers || pointers.version !== 2) return 'no-checkpoint'
-  if (!pointers.previous) return 'no-predecessor'
-  if (!(await readCheckpoint(storage, pointers.previous))) return 'unverified-predecessor'
-  await removeCoveredRows(storage, pointers.previous.throughSequence)
+  const storedPointers = await storage.get<unknown>(CHECKPOINT_POINTERS)
+  if (storedPointers === undefined) return 'no-checkpoint'
+  const pointers = checkpointPointerEnvelope(storedPointers)
+  if (!pointers) return 'unverified-predecessor'
+  const active = checkpointManifest(pointers.active)
+  if (!active) return 'unverified-predecessor'
+  if (pointers.previous === undefined) return 'no-predecessor'
+  const previous = checkpointManifest(pointers.previous)
+  if (
+    !previous ||
+    previous.generation >= active.generation ||
+    previous.throughSequence > active.throughSequence
+  ) {
+    return 'unverified-predecessor'
+  }
+  if (!(await readCheckpoint(storage, previous))) return 'unverified-predecessor'
+  await removeCoveredRows(storage, previous.throughSequence)
   await removeInactiveCheckpoints(
     storage,
-    new Set([pointers.active.generation, pointers.previous.generation]),
+    new Set([active.generation, previous.generation]),
   )
   return 'reclaimed'
 }
@@ -448,23 +469,114 @@ function requestTooLarge(maxBytes: number): ReplayLimitError {
 
 async function readCheckpoint(
   storage: LogStorage,
-  expected: CheckpointManifest,
-): Promise<StoredEvent[] | undefined> {
+  untrustedExpected: unknown,
+): Promise<{ events: StoredEvent[]; manifest: CheckpointManifest } | undefined> {
   try {
-    const manifest = await storage.get<CheckpointManifest>(manifestKey(expected.generation))
-    if (!manifest || JSON.stringify(manifest) !== JSON.stringify(expected)) return undefined
+    // Pointer metadata controls both a storage key and an allocation. Trust none
+    // of it until every field has a finite, legitimate bound.
+    const expected = checkpointManifest(untrustedExpected)
+    if (!expected) return undefined
+    const storedManifest = await storage.get<unknown>(manifestKey(expected.generation))
+    const manifest = checkpointManifest(storedManifest)
+    if (!manifest || !sameCheckpointManifest(manifest, expected)) return undefined
     const keys = Array.from({ length: manifest.chunkCount }, (_, index) => chunkKey(manifest.generation, index))
     const rows = await storage.get<StoredEvent[]>(keys)
     if (rows.size !== keys.length) return undefined
-    const events = keys.flatMap((key) => rows.get(key) ?? [])
+    const events: StoredEvent[] = []
+    for (const key of keys) {
+      const chunk = rows.get(key)
+      if (!Array.isArray(chunk) || chunk.length < 1 || chunk.length > manifest.eventCount - events.length) {
+        return undefined
+      }
+      events.push(...chunk)
+    }
     if (events.length !== manifest.eventCount) return undefined
     if (logSize(events).bytes !== manifest.eventBytes) return undefined
     if (seedAddress(events) !== manifest.registryAddress) return undefined
     if ((await sha256(JSON.stringify(events))) !== manifest.digest) return undefined
-    return sortEvents(events)
+    return { events: sortEvents(events), manifest }
   } catch {
     return undefined
   }
+}
+
+function checkpointPointerEnvelope(value: unknown): { active: unknown; previous?: unknown } | undefined {
+  if (!isRecord(value) || value.version !== 2 || !Object.hasOwn(value, 'active')) return undefined
+  return {
+    active: value.active,
+    ...(Object.hasOwn(value, 'previous') ? { previous: value.previous } : {}),
+  }
+}
+
+function checkpointManifest(value: unknown): CheckpointManifest | undefined {
+  if (!isRecord(value) || value.version !== 2) return undefined
+  const fields = [
+    'version',
+    'generation',
+    'throughSequence',
+    'chunkCount',
+    'eventCount',
+    'eventBytes',
+    'digest',
+    'registryAddress',
+    'createdAt',
+  ] as const
+  if (Object.keys(value).length !== fields.length || fields.some((field) => !Object.hasOwn(value, field))) {
+    return undefined
+  }
+  if (!safeInteger(value.generation, 1)) return undefined
+  if (!safeInteger(value.throughSequence, 0)) return undefined
+  if (!safeInteger(value.chunkCount, 1) || value.chunkCount > MAX_CHECKPOINT_CHUNKS) return undefined
+  if (!safeInteger(value.eventCount, 1) || value.eventCount > LOG_LIMITS.replayEvents) return undefined
+  if (!safeInteger(value.eventBytes, 1) || value.eventBytes > LOG_LIMITS.replayBytes) return undefined
+  if (
+    value.chunkCount > value.eventCount ||
+    value.eventBytes < value.eventCount ||
+    value.throughSequence < value.eventCount - 1
+  ) {
+    return undefined
+  }
+  if (typeof value.digest !== 'string' || !/^[0-9a-f]{64}$/.test(value.digest)) return undefined
+  if (
+    typeof value.registryAddress !== 'string' ||
+    value.registryAddress.length < 1 ||
+    value.registryAddress.length > 128
+  ) {
+    return undefined
+  }
+  if (!safeInteger(value.createdAt, 0)) return undefined
+  return value as unknown as CheckpointManifest
+}
+
+function sameCheckpointManifest(left: CheckpointManifest, right: CheckpointManifest): boolean {
+  return (
+    left.version === right.version &&
+    left.generation === right.generation &&
+    left.throughSequence === right.throughSequence &&
+    left.chunkCount === right.chunkCount &&
+    left.eventCount === right.eventCount &&
+    left.eventBytes === right.eventBytes &&
+    left.digest === right.digest &&
+    left.registryAddress === right.registryAddress &&
+    left.createdAt === right.createdAt
+  )
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function safeInteger(value: unknown, minimum: number): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum
+}
+
+function recoverLegacyOrThrow(legacyEvents: StoredEvent[]): LoadedLog {
+  if (legacyEvents.some((event) => event.kind === 'seed')) {
+    return { events: legacyEvents, tailEvents: legacyEvents.length, recoveredFrom: 'legacy' }
+  }
+  throw new Error(
+    'The active and previous mock checkpoints failed verification and no complete v1 seed log remains. Restore the named Durable Object with point-in-time recovery; do not reset it.',
+  )
 }
 
 function chunkEvents(events: readonly StoredEvent[]): StoredEvent[][] {
