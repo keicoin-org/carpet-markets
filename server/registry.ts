@@ -505,6 +505,12 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
         address: kei.address,
         chain: options.chain ?? { mode: 'mock', sdkNetwork: kei.network, node: null, ephemeral: true },
         launchFee: formatKei(LAUNCH_FEE_RAW, 18),
+        // The breakdown travels with the total so the launch screen states the
+        // constants rather than a caption that agrees with them today.
+        launchFeeParts: {
+          burn: formatKei(LAUNCH_BURN_RAW, 18),
+          margin: formatKei(LAUNCH_MARGIN_RAW, 18),
+        },
         listings,
       }
     },

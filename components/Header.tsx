@@ -23,6 +23,7 @@ import Link from 'next/link'
 import { KEI_RAW, formatKei, shortAddress } from '../shared/format'
 import { projected, spendable, settling } from '../lib/balance'
 import { useMarket } from '../lib/use-market'
+import { FeedStatus } from './FeedStatus'
 import { NetworkBadge } from './NetworkBadge'
 
 export function Header() {
@@ -40,6 +41,7 @@ export function Header() {
         </Link>
 
         <NetworkBadge chain={facts?.chain ?? null} />
+        <FeedStatus />
 
         <div className="ml-auto flex items-center gap-2 sm:gap-2.5">
           {trader && (
@@ -57,15 +59,17 @@ export function Header() {
               <span className="ml-1 text-fainter">Kei</span>
               <span className="sr-only"> confirmed and spendable</span>
             </span>
-            {moving && (
-              <span className="mt-0.5 font-mono text-[10px] text-dim tabular" aria-live="polite">
-                {formatKei(soon, 4)} once settled
-                <span className="sr-only">
-                  , which includes {funds.arrivals} arrival{funds.arrivals === 1 ? '' : 's'} not yet signed for and
-                  cannot be spent until it is
-                </span>
-              </span>
-            )}
+            <span className="mt-0.5 block font-mono text-[10px] text-dim tabular" aria-live="polite">
+              {moving && (
+                <>
+                  {formatKei(soon, 4)} once settled
+                  <span className="sr-only">
+                    , which includes {funds.arrivals} arrival{funds.arrivals === 1 ? '' : 's'} not yet signed for and
+                    cannot be spent until it is
+                  </span>
+                </>
+              )}
+            </span>
           </p>
 
           <button

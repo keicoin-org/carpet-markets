@@ -20,7 +20,7 @@
  * sentence somebody reads is the same one a test asserts.
  */
 
-import { useId, useMemo, useState } from 'react'
+import { useEffect, useId, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { Offer } from 'kei-transaction'
 
@@ -30,6 +30,7 @@ import { spendable, spendableCoins } from '../lib/balance'
 import { bidBlocker, sellBlocker, type Blocker } from '../lib/refusals'
 import { useMarket, useMyOffers } from '../lib/use-market'
 import { Ladder, spread } from './OrderBook'
+import { Tabs } from './Tabs'
 
 type Tab = 'buy' | 'sell'
 
@@ -56,48 +57,63 @@ export function TradePanel({
 
   return (
     <section className="panel overflow-hidden" aria-label={`Trade ${listing.symbol}`}>
-      <div className="grid grid-cols-2 border-b border-line" role="tablist" aria-label="Buy or sell">
-        {(['buy', 'sell'] as const).map((key) => (
-          <button
-            key={key}
-            type="button"
-            role="tab"
-            id={`tab-${key}`}
-            aria-selected={tab === key}
-            aria-controls={`panel-${key}`}
-            onClick={() => setTab(key)}
-            className={`px-3 py-2.5 text-sm font-medium capitalize transition-colors ${
-              tab === key ? (key === 'buy' ? 'bg-up/10 text-up' : 'bg-down/10 text-down') : 'text-fainter hover:text-dim'
-            }`}
-          >
-            {key}
-            {counts[key] > 0 && <span className="ml-1.5 font-mono text-[10px] tabular">{counts[key]}</span>}
-          </button>
-        ))}
-      </div>
+      <Tabs
+        label="Buy or sell"
+        className="border-b border-line"
+        tabClassName="flex-1 px-3 py-2.5 text-sm font-medium capitalize"
+        active={tab}
+        onPick={setTab}
+        tabs={[
+          {
+            key: 'buy',
+            label: (
+              <>
+                buy
+                {counts.buy > 0 && <span className="ml-1.5 font-mono text-[10px] tabular">{counts.buy}</span>}
+              </>
+            ),
+            name: `Buy — ${counts.buy} open ${counts.buy === 1 ? 'offer' : 'offers'}`,
+            // A bottom border as well as a colour: selection signalled by hue
+            // alone is unreadable to a third of the reasons somebody has a
+            // preference about hue.
+            selectedClassName: 'border-b-2 border-up bg-up/10 text-up',
+          },
+          {
+            key: 'sell',
+            label: (
+              <>
+                sell
+                {counts.sell > 0 && <span className="ml-1.5 font-mono text-[10px] tabular">{counts.sell}</span>}
+              </>
+            ),
+            name: `Sell — ${counts.sell} open ${counts.sell === 1 ? 'bid' : 'bids'}`,
+            selectedClassName: 'border-b-2 border-down bg-down/10 text-down',
+          },
+        ]}
+      >
+        <p className="border-b border-line px-3 py-1.5 font-mono text-[10px] text-fainter tabular">
+          {spread(asks, bids, listing.asset)}
+        </p>
 
-      <p className="border-b border-line px-3 py-1.5 font-mono text-[10px] text-fainter tabular">
-        {spread(asks, bids, listing.asset)}
-      </p>
-
-      <div className="p-3" role="tabpanel" id={`panel-${tab}`} aria-labelledby={`tab-${tab}`}>
-        {tab === 'buy' ? (
-          <>
-            <Ladder side="ask" listing={listing} offers={asks} held={held} loading={loading} onTraded={onTraded} />
-            <BidForm listing={listing} startOpen={asks.length === 0} onTraded={onTraded} />
-          </>
-        ) : (
-          <>
-            <SellForm listing={listing} held={held} onTraded={onTraded} />
-            {bids.length > 0 && (
-              <div className="mt-4 border-t border-line pt-3">
-                <h4 className="eyebrow mb-1.5">Or fill a bid now</h4>
-                <Ladder side="bid" listing={listing} offers={bids} held={held} loading={loading} onTraded={onTraded} />
-              </div>
-            )}
-          </>
-        )}
-      </div>
+        <div className="p-3">
+          {tab === 'buy' ? (
+            <>
+              <Ladder side="ask" listing={listing} offers={asks} held={held} loading={loading} onTraded={onTraded} />
+              <BidForm listing={listing} startOpen={asks.length === 0} onTraded={onTraded} />
+            </>
+          ) : (
+            <>
+              <SellForm listing={listing} held={held} onTraded={onTraded} />
+              {bids.length > 0 && (
+                <div className="mt-4 border-t border-line pt-3">
+                  <h3 className="eyebrow mb-1.5">Or fill a bid now</h3>
+                  <Ladder side="bid" listing={listing} offers={bids} held={held} loading={loading} onTraded={onTraded} />
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </Tabs>
     </section>
   )
 }
@@ -147,7 +163,7 @@ function SellForm({ listing, held, onTraded }: { listing: Listing; held: number;
             aria-describedby={noteId}
             aria-invalid={blocked?.code === 'no-amount' || blocked?.code === 'over-held'}
             onChange={(event) => setAmount(event.target.value)}
-            className="mt-1 w-full rounded-md border border-line bg-floor px-2.5 py-2 font-mono text-sm focus:border-line-bright"
+            className="mt-1 w-full field px-2.5 py-2 font-mono text-sm"
           />
         </label>
         <label className="block" htmlFor={priceId}>
@@ -160,7 +176,7 @@ function SellForm({ listing, held, onTraded }: { listing: Listing; held: number;
             aria-describedby={noteId}
             aria-invalid={blocked?.code === 'no-price'}
             onChange={(event) => setEach(event.target.value)}
-            className="mt-1 w-full rounded-md border border-line bg-floor px-2.5 py-2 font-mono text-sm focus:border-line-bright"
+            className="mt-1 w-full field px-2.5 py-2 font-mono text-sm"
           />
         </label>
       </div>
@@ -177,9 +193,13 @@ function SellForm({ listing, held, onTraded }: { listing: Listing; held: number;
 
       <button
         type="button"
-        disabled={blocked !== null}
-        className="w-full rounded-md border border-down/60 bg-down/10 px-3 py-2 text-sm font-medium text-down transition-colors hover:bg-down/20 disabled:cursor-not-allowed disabled:opacity-40"
+        aria-disabled={blocked !== null}
+        aria-describedby={noteId}
+        className={`w-full rounded-md border border-down/60 bg-down/10 px-3 py-2 text-sm font-medium text-down transition-colors hover:bg-down/20 ${
+          blocked ? 'cursor-not-allowed opacity-40' : ''
+        }`}
         onClick={() =>
+          blocked ||
           void act(
             'sell',
             `Listing ${formatCoins(count)} ${listing.symbol}`,
@@ -222,6 +242,13 @@ function BidForm({
   onTraded: () => void
 }) {
   const { trader, funds, busy, act } = useMarket()
+  // Opened *by* `startOpen` rather than controlled by it. The book polls, so a
+  // controlled `open` slams this shut under somebody typing in it the moment an
+  // ask appears — and forces it open again when the last one is filled.
+  const [open, setOpen] = useState(startOpen)
+  useEffect(() => {
+    if (startOpen) setOpen(true)
+  }, [startOpen])
   const [amount, setAmount] = useState('1000')
   const [each, setEach] = useState('0.0001')
   const amountId = useId()
@@ -243,7 +270,11 @@ function BidForm({
   })
 
   return (
-    <details open={startOpen} className="mt-3 border-t border-line pt-3">
+    <details
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+      className="mt-3 border-t border-line pt-3"
+    >
       <summary className="cursor-pointer select-none text-xs text-dim hover:text-ink">
         Bid for it — lock Kei until a holder fills it
       </summary>
@@ -258,8 +289,9 @@ function BidForm({
               inputMode="numeric"
               value={amount}
               aria-describedby={noteId}
+              aria-invalid={blocked?.code === 'no-amount'}
               onChange={(event) => setAmount(event.target.value)}
-              className="mt-1 w-full rounded-md border border-line bg-floor px-2.5 py-2 font-mono text-sm focus:border-line-bright"
+              className="mt-1 w-full field px-2.5 py-2 font-mono text-sm"
             />
           </label>
           <label className="block" htmlFor={priceId}>
@@ -270,8 +302,9 @@ function BidForm({
               inputMode="decimal"
               value={each}
               aria-describedby={noteId}
+              aria-invalid={blocked?.code === 'no-price'}
               onChange={(event) => setEach(event.target.value)}
-              className="mt-1 w-full rounded-md border border-line bg-floor px-2.5 py-2 font-mono text-sm focus:border-line-bright"
+              className="mt-1 w-full field px-2.5 py-2 font-mono text-sm"
             />
           </label>
         </div>
@@ -285,9 +318,13 @@ function BidForm({
 
         <button
           type="button"
-          disabled={blocked !== null}
-          className="w-full rounded-md border border-up/60 bg-up/10 px-3 py-2 text-sm font-medium text-up transition-colors hover:bg-up/20 disabled:cursor-not-allowed disabled:opacity-40"
+          aria-disabled={blocked !== null}
+          aria-describedby={noteId}
+          className={`w-full rounded-md border border-up/60 bg-up/10 px-3 py-2 text-sm font-medium text-up transition-colors hover:bg-up/20 ${
+            blocked ? 'cursor-not-allowed opacity-40' : ''
+          }`}
           onClick={() =>
+            blocked ||
             void act(
               'buy',
               `Bidding for ${formatCoins(count)} ${listing.symbol}`,

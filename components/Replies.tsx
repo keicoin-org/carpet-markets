@@ -22,6 +22,7 @@ import type { Listing } from '../shared/listing'
 import type { Reply } from '../shared/social'
 import { REPLY_MAX } from '../shared/social'
 import { useMarket } from '../lib/use-market'
+import { Caveat } from './Caveat'
 
 export function Replies({ listing, replies }: { listing: Listing; replies: Reply[] }) {
   const { trader, busy, act } = useMarket()
@@ -37,16 +38,17 @@ export function Replies({ listing, replies }: { listing: Listing; replies: Reply
 
   return (
     <section className="p-3">
-      <p className="rounded border border-line bg-floor px-2.5 py-2 text-[11px] leading-relaxed text-fainter">
-        This thread is the only thing on the page that is not a block. The registry stores it, the registry can lose
-        it, and consensus has never seen it. What the signature buys is narrower and still worth having: nobody can
-        post as the creator.
-      </p>
+      {/* The sentence lives in `shared/caveats.ts` with the demo's other known
+          holes, so the set is checkable and this one cannot quietly drift from
+          the way the README states it (SPEC §9.6, criterion 9). */}
+      <div className="rounded border border-line bg-floor px-2.5 py-2">
+        <Caveat id="off-chain-replies" className="border-l-0 pl-0" />
+      </div>
 
       {replies.length === 0 ? (
         <p className="py-4 text-center text-xs text-fainter">Nothing said about this one yet.</p>
       ) : (
-        <ul className="mt-2.5 max-h-96 space-y-2.5 overflow-y-auto pr-1">
+        <ul tabIndex={0} role="group" aria-label="Replies" className="mt-2.5 max-h-96 space-y-2.5 overflow-y-auto pr-1">
           {replies.map((reply) => {
             const author =
               reply.author === listing.creator ? 'creator' : reply.author === trader?.address ? 'you' : null
@@ -88,7 +90,7 @@ export function Replies({ listing, replies }: { listing: Listing; replies: Reply
           }}
           aria-label={`Reply about ${listing.symbol}. Signed with your wallet key.`}
           placeholder="Say something. It will be signed with your wallet key."
-          className="w-full resize-y rounded-md border border-line bg-floor px-2.5 py-2 text-xs placeholder:text-fainter focus:border-line-bright"
+          className="w-full resize-y field px-2.5 py-2 text-xs placeholder:text-fainter"
         />
         <div className="mt-1.5 flex items-center justify-between gap-2">
           <span className="font-mono text-[10px] text-fainter tabular">

@@ -93,12 +93,12 @@ function Row({
       )}
 
       {broken && tx.problem && (
-        <p className="mt-1 text-xs leading-relaxed text-[#ffd9d9]">{tx.problem}</p>
+        <p className="mt-1 break-words text-xs leading-relaxed text-[#ffd9d9]">{tx.problem}</p>
       )}
 
       {broken && tx.recovery && (
         <div className="mt-1.5 flex items-start justify-between gap-2">
-          <p className="text-[11px] leading-relaxed text-dim">{tx.recovery.hint}</p>
+          <p className="min-w-0 break-words text-[11px] leading-relaxed text-dim">{tx.recovery.hint}</p>
           {retryable(tx) && (
             <button
               type="button"

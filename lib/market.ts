@@ -23,6 +23,7 @@ import {
   Kei,
   KeiError,
   seedStoreKey,
+  type AssetInfo,
   type Offer,
   type Settlement,
   type Trade,
@@ -66,6 +67,22 @@ export interface Trader {
    */
   incoming(): Promise<{ kei: bigint; arrivals: number }>
   facts(): Promise<MarketFacts>
+  /**
+   * What the ledger itself says about a coin, read by this browser.
+   *
+   * Everything else on the coin page arrives through the registry, which is an
+   * index and is trusted only to say which accounts to read. This one call goes
+   * past it: `token.info()` is an `asset_info` RPC to the node, and what comes
+   * back is the issuance block's own record — the transfer policy the node
+   * validates every move against, the derived asset id, the cap, and what is
+   * actually circulating.
+   *
+   * It is here so the policy badge can *link to the fact rather than restate it*
+   * (SPEC §9.6, criterion 7). A badge sourced from the same JSON as the rest of
+   * the card is a claim about the registry; this is a claim about the chain, and
+   * they are allowed to disagree — which is exactly why the panel shows both.
+   */
+  assetInfo(asset: string): Promise<AssetInfo>
   /**
    * What has settled anywhere on the board lately, newest first.
    *
@@ -162,6 +179,10 @@ export async function connect(): Promise<Trader> {
     },
 
     facts: () => get<MarketFacts>('market/facts'),
+
+    // Straight to the node. Nothing about this answer passes through the
+    // registry, which is the entire point of it.
+    assetInfo: (asset) => kei.token(asset).then((token) => token.info()),
 
     activity: (limit = 24) =>
       get<{ trades: Trade[] }>(`market/activity?limit=${limit}`).then((body) => body.trades),

@@ -147,19 +147,28 @@ export function Ladder({
                 {formatPrice(keiAmount(offer, listing.asset))}
               </td>
               <td className="py-1.5 pl-2 text-right align-top">
+                {/* `aria-disabled` rather than `disabled`, and the refusal in
+                    the accessible name rather than in a `title`. A disabled
+                    button leaves the tab order, so a keyboard visitor never
+                    reaches the row and never hears why — and a `title` fires on
+                    hover only, which is the one input this page cannot assume.
+                    Criterion 2 says the reason is named *before* the action;
+                    an unreachable tooltip does not name it at all. */}
                 <button
                   type="button"
-                  disabled={blocked !== null}
-                  title={blocked ? `${blocked.sentence}${blocked.fix ? ` ${blocked.fix}` : ''}` : undefined}
+                  aria-disabled={blocked !== null}
                   aria-label={`${side === 'ask' ? 'Buy' : 'Sell'} ${formatCoins(size)} ${listing.symbol} for ${formatPrice(
                     keiAmount(offer, listing.asset),
-                  )} Kei`}
-                  className={`rounded border px-2 py-1 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                  )} Kei${blocked ? ` — unavailable: ${blocked.sentence}${blocked.fix ? ` ${blocked.fix}` : ''}` : ''}`}
+                  className={`rounded border px-2 py-1 text-xs font-medium transition-colors ${
+                    blocked ? 'cursor-not-allowed opacity-40' : ''
+                  } ${
                     side === 'ask'
                       ? 'border-up/60 bg-up/10 text-up hover:bg-up/20'
                       : 'border-down/60 bg-down/10 text-down hover:bg-down/20'
                   }`}
                   onClick={() =>
+                    blocked ||
                     void act(
                       side === 'ask' ? 'buy' : 'sell',
                       side === 'ask'
