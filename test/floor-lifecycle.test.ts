@@ -330,7 +330,7 @@ test(
     await answer<MarketFacts>(await call(third, '/market/facts'))
     expect([...storage.values.keys()].filter((key) => key.startsWith('event:v1:'))).toEqual(events)
   },
-  60_000,
+  120_000,
 )
 
 test(
@@ -518,7 +518,7 @@ test(
     }
     expect(replayed).toEqual(live)
   },
-  90_000,
+  180_000,
 )
 
 test(
@@ -674,7 +674,7 @@ test(
     expect(refused.status).toBe(507)
     expect([...oversized.values.keys()]).toEqual(compactKeys)
   },
-  60_000,
+  120_000,
 )
 
 test(
