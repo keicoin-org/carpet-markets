@@ -236,6 +236,67 @@ test(
   30_000,
 )
 
+test(
+  'compat audits oversized legacy state without deleting it, while compact refuses unsafe activation',
+  async () => {
+    const base = new FakeStorage()
+    await answer<MarketFacts>(await call(openFloor(base), '/market/facts'))
+
+    const compat = new FakeStorage()
+    for (const [key, value] of base.values) compat.values.set(key, structuredClone(value))
+    for (let sequence = 1; sequence <= 20; sequence += 1) {
+      compat.values.set(`event:v1:${sequence.toString().padStart(12, '0')}`, {
+        version: 1,
+        sequence,
+        status: 'accepted',
+        kind: 'watch',
+        at: sequence,
+        address: 'kei_same_legacy_watcher',
+      })
+    }
+    const pendingKey = 'event:v1:000000000021'
+    compat.values.set(pendingKey, {
+      version: 1,
+      sequence: 21,
+      status: 'pending',
+      kind: 'rpc',
+      at: 21,
+      body: JSON.stringify({ action: 'process', block: {} }),
+    })
+    compat.values.set('meta:event-sequence:v1', 22)
+    const acceptedBefore = [...compat.values.keys()].filter((key) => key.startsWith('event:v1:') && key !== pendingKey)
+
+    const compatible = openFloor(compat, { CARPET_NETWORK: 'mock', CARPET_LOG_MODE: 'compat' })
+    expect((await answer<MarketFacts>(await call(compatible, '/market/facts'))).listings).toHaveLength(6)
+    expect(compat.values.has(pendingKey)).toBe(false)
+    expect(acceptedBefore.every((key) => compat.values.has(key))).toBe(true)
+    await answer(await call(compatible, '/market/watch', { address: 'kei_compat_still_accepts_writes' }))
+    expect(compat.values.get('meta:event-sequence:v1')).toBe(23)
+    expect([...compat.values.keys()].some((key) => key.startsWith('checkpoint:v2:'))).toBe(false)
+
+    const oversized = new FakeStorage()
+    for (const [key, value] of base.values) oversized.values.set(key, structuredClone(value))
+    for (let sequence = 1; sequence <= 16; sequence += 1) {
+      oversized.values.set(`event:v1:${sequence.toString().padStart(12, '0')}`, {
+        version: 1,
+        sequence,
+        status: 'accepted',
+        kind: 'watch',
+        at: sequence,
+        address: `kei_distinct_legacy_watcher_${sequence}`,
+      })
+    }
+    oversized.values.set('meta:event-sequence:v1', 17)
+    const compactKeys = [...oversized.values.keys()]
+    const compacting = openFloor(oversized, { CARPET_NETWORK: 'mock', CARPET_LOG_MODE: 'compact' })
+    expect((await answer<MarketFacts>(await call(compacting, '/market/facts'))).listings).toHaveLength(6)
+    const refused = await call(compacting, '/market/watch', { address: 'kei_no_growth_over_bound' })
+    expect(refused.status).toBe(507)
+    expect([...oversized.values.keys()]).toEqual(compactKeys)
+  },
+  60_000,
+)
+
 test('the actual Floor still refuses mainnet before writing durable demo state', async () => {
   const storage = new FakeStorage()
   const response = await call(openFloor(storage, { CARPET_NETWORK: 'mainnet' }), '/market/facts')

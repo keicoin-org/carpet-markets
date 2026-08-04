@@ -17,6 +17,22 @@ import { NetworkRefused } from '../shared/network.js'
 import { ReplyError } from '../shared/social.js'
 import { RegistryError, startRegistry, type Registry } from '../server/registry.js'
 import { Threads, type PostReply } from '../server/social.js'
+import {
+  LOG_LIMITS,
+  NEXT_SEQUENCE,
+  ReplayLimitError,
+  canonicalEvents,
+  eventBytes,
+  eventKey,
+  loadLog,
+  logSize,
+  readBoundedText,
+  replayLimitError,
+  writeCheckpoint,
+  type CheckpointManifest,
+  type EventInput,
+  type StoredEvent,
+} from './durable-log.js'
 
 interface Env {
   ASSETS: Fetcher
@@ -27,24 +43,10 @@ interface Env {
   CARPET_NETWORK?: string
   /** Node URL when `CARPET_NETWORK=testnet`. */
   CARPET_NODE?: string
+  /** Two-release migration gate: `compat` first, then explicitly `compact`. */
+  CARPET_LOG_MODE?: string
 }
-
-type EventInput =
-  | { at: number; kind: 'seed'; registryAddress: string }
-  | { at: number; kind: 'rpc'; body: string }
-  | { at: number; kind: 'launch'; body: { address: string } & Record<string, unknown> }
-  | { at: number; kind: 'watch'; address: string }
-  | { at: number; kind: 'reply'; body: PostReply }
-
-type StoredEvent = EventInput & { version: 1; sequence: number; status: 'pending' | 'accepted' }
-
-const EVENT_PREFIX = 'event:v1:'
-const NEXT_SEQUENCE = 'meta:event-sequence:v1'
 const MOUNT = '/examples/carpet-markets'
-
-function eventKey(sequence: number): string {
-  return `${EVENT_PREFIX}${sequence.toString().padStart(12, '0')}`
-}
 
 function apiPath(url: URL): string | null {
   const path = url.pathname.startsWith(MOUNT) ? url.pathname.slice(MOUNT.length) : url.pathname
@@ -55,21 +57,27 @@ export class Floor extends DurableObject<Env> {
   #booting: Promise<{ registry: Registry; chain: ChainSource }> | undefined
   #now = Date.now()
   #threads = new Threads(() => this.#now)
-  readonly #stored: Promise<StoredEvent[]>
+  readonly #stored: Promise<Awaited<ReturnType<typeof loadLog>>>
   readonly #mutations = new Queue()
+  #history: StoredEvent[] = []
+  #tailEvents = 0
+  #checkpoint: CheckpointManifest | undefined
+  #acceptedWindow: { at: number; bytes: number }[] = []
+  #replaying = true
+  #authorityBlocked: ReplayLimitError | undefined
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
     // Storage initialization only: crypto, chain construction and replay remain
     // outside blockConcurrencyWhile so the gate never contains long work.
     this.#stored = ctx.blockConcurrencyWhile(async () => {
-      const rows = await ctx.storage.list<StoredEvent>({ prefix: EVENT_PREFIX })
-      return [...rows.values()].sort((a, b) => a.sequence - b.sequence)
+      return loadLog(ctx.storage)
     })
   }
 
   #ready(): Promise<{ registry: Registry; chain: ChainSource }> {
     this.#booting ??= (async () => {
+      const bootStarted = Date.now()
       const chain = await openChain({
         network: this.env.CARPET_NETWORK,
         node: this.env.CARPET_NODE,
@@ -89,7 +97,10 @@ export class Floor extends DurableObject<Env> {
         return { registry, chain }
       }
 
-      const stored = await this.#stored
+      const loaded = await this.#stored
+      const stored = loaded.events
+      this.#checkpoint = loaded.checkpoint
+      this.#tailEvents = loaded.tailEvents
       const registrySeed = this.env.CARPET_SEED ?? DEMO_REGISTRY_SEED
       const registry = await startRegistry({
         seed: registrySeed,
@@ -117,6 +128,7 @@ export class Floor extends DurableObject<Env> {
 
       if (stored.length === 0) {
         const seeded = await this.#append({ kind: 'seed', registryAddress: registry.address, at: Date.now() })
+        if ('refusal' in seeded) throw seeded.refusal
         try {
           await this.#apply(seeded.event, state)
           await this.#accept(seeded.event)
@@ -141,6 +153,7 @@ export class Floor extends DurableObject<Env> {
                 }
               }
               if (event.status === 'pending') await this.#accept(event)
+              else this.#history.push(event)
             } catch (error) {
               if (event.status === 'pending' && expectedRejection(error)) {
                 await this.ctx.storage.delete(eventKey(event.sequence))
@@ -156,6 +169,24 @@ export class Floor extends DurableObject<Env> {
       }
 
       this.#now = Date.now()
+      this.#tailEvents = this.#checkpoint
+        ? this.#history.filter((event) => event.sequence > this.#checkpoint!.throughSequence).length
+        : this.#history.length
+      this.#authorityBlocked = replayLimitError(canonicalEvents(this.#history))
+      this.#replaying = false
+      const replayMs = Date.now() - bootStarted
+      this.#observe('replay', {
+        replayMs,
+        checkpointGeneration: this.#checkpoint?.generation ?? null,
+        recoveredFrom: loaded.recoveredFrom ?? null,
+        mode: this.env.CARPET_LOG_MODE ?? 'compat',
+        admissionBlocked: this.#authorityBlocked?.message ?? null,
+        ...this.#measure(),
+      })
+      // The explicit phase-2 configuration can migrate an oversized raw v1 log
+      // whose canonical accepted authority is still inside the measured bound.
+      // Compatibility mode never reaches this write/delete path.
+      await this.#compactIfNeeded()
       return state
     })()
     return this.#booting
@@ -175,24 +206,35 @@ export class Floor extends DurableObject<Env> {
       // A failed replay may have populated part of an in-memory thread cache.
       // The durable log remains authoritative, so a retry starts that cache over.
       this.#threads = new Threads(() => this.#now)
+      this.#history = []
+      this.#replaying = true
       const message = error instanceof Error ? error.message : String(error)
       return json({ error: message }, error instanceof NetworkRefused ? 503 : 500)
     }
 
     if (path === '/rpc') {
       if (chain.sdkNetwork !== 'mock') return chain.rpc(request)
-      const body = await request.clone().text()
+      let body: string
+      try {
+        body = await readBoundedText(request)
+      } catch (error) {
+        if (error instanceof ReplayLimitError) return json({ error: error.message }, error.status)
+        throw error
+      }
       let action: unknown
       try {
         action = (JSON.parse(body) as { action?: unknown }).action
       } catch {
-        return chain.rpc(request)
+        return chain.rpc(rebuiltRequest(request, body))
       }
-      if (action !== 'process' && action !== 'faucet') return chain.rpc(request)
+      if (action !== 'process' && action !== 'faucet') return chain.rpc(rebuiltRequest(request, body))
       try {
         return await this.#mutate({ kind: 'rpc', body, at: Date.now() }, { registry, chain })
       } catch (error) {
-        return json({ error: error instanceof Error ? error.message : String(error) }, 500)
+        return json(
+          { error: error instanceof Error ? error.message : String(error) },
+          error instanceof ReplayLimitError ? error.status : 500,
+        )
       }
     }
 
@@ -235,11 +277,27 @@ export class Floor extends DurableObject<Env> {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const theirs = error instanceof ListingError || error instanceof RegistryError || error instanceof ReplyError
-      return json({ error: message }, theirs ? 400 : 500)
+      return json({ error: message }, error instanceof ReplayLimitError ? error.status : theirs ? 400 : 500)
     }
   }
 
-  async #append(input: EventInput): Promise<{ key: string; event: StoredEvent }> {
+  async #append(
+    input: EventInput,
+  ): Promise<{ key: string; event: StoredEvent } | { refusal: ReplayLimitError }> {
+    // Admission happens outside storage.transaction(). Workerd treats an error
+    // escaping a transaction callback as an aborted storage turn even when the
+    // caller later catches it. The mutation queue makes this projection stable,
+    // and the real sequence changes the serialized size by only bounded digits.
+    const projected = {
+      version: 1 as const,
+      sequence: Number.MAX_SAFE_INTEGER,
+      status: 'accepted' as const,
+      ...input,
+    } as StoredEvent
+    if (this.env.CARPET_LOG_MODE === 'compact') {
+      const refusal = replayLimitError(canonicalEvents([...this.#history, projected]))
+      if (refusal) return { refusal }
+    }
     return this.ctx.storage.transaction(async (storage) => {
       const sequence = (await storage.get<number>(NEXT_SEQUENCE)) ?? 0
       const event = { version: 1 as const, sequence, status: 'pending' as const, ...input } as StoredEvent
@@ -252,7 +310,80 @@ export class Floor extends DurableObject<Env> {
   }
 
   async #accept(event: StoredEvent): Promise<void> {
-    await this.ctx.storage.put(eventKey(event.sequence), { ...event, status: 'accepted' })
+    const accepted = { ...event, status: 'accepted' as const }
+    await this.ctx.storage.put(eventKey(event.sequence), accepted)
+    this.#history.push(accepted)
+    this.#authorityBlocked = replayLimitError(canonicalEvents(this.#history))
+    this.#tailEvents += 1
+    const bytes = eventBytes(accepted)
+    const now = Date.now()
+    this.#acceptedWindow.push({ at: now, bytes })
+    this.#acceptedWindow = this.#acceptedWindow.filter((entry) => now - entry.at < 60_000)
+    this.#observe('accepted', {
+      kind: accepted.kind,
+      acceptedBytes: bytes,
+      acceptedBytesLastMinute: this.#acceptedWindow.reduce((total, entry) => total + entry.bytes, 0),
+      storageOperations: 2,
+      storageKeyWrites: 3,
+      ...this.#measure(),
+    })
+    if (!this.#replaying) await this.#compactIfNeeded()
+  }
+
+  async #compactIfNeeded(): Promise<void> {
+    if (this.env.CARPET_LOG_MODE !== 'compact' || this.#tailEvents < LOG_LIMITS.compactAfter) return
+    if (this.#authorityBlocked) {
+      this.#observe('activation-refused', { error: this.#authorityBlocked.message, ...this.#measure() })
+      return
+    }
+    const before = this.#measure()
+    const started = Date.now()
+    try {
+      this.#checkpoint = await writeCheckpoint(this.ctx.storage, this.#history, this.#checkpoint)
+      this.#history = canonicalEvents(this.#history)
+      this.#tailEvents = 0
+      this.#authorityBlocked = undefined
+      this.#observe('compaction', {
+        ok: true,
+        compactionMs: Date.now() - started,
+        generation: this.#checkpoint.generation,
+        before,
+        after: this.#measure(),
+      })
+    } catch (error) {
+      this.#observe('compaction', {
+        ok: false,
+        compactionMs: Date.now() - started,
+        before,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  #measure(): Record<string, unknown> {
+    const authority = canonicalEvents(this.#history)
+    const size = logSize(authority)
+    const raw = logSize(this.#history)
+    const byKind: Record<string, { events: number; bytes: number }> = {}
+    for (const event of authority) {
+      const current = byKind[event.kind] ?? { events: 0, bytes: 0 }
+      current.events += 1
+      current.bytes += eventBytes(event)
+      byKind[event.kind] = current
+    }
+    return {
+      events: size.events,
+      bytes: size.bytes,
+      rawEvents: raw.events,
+      rawBytes: raw.bytes,
+      tailEvents: this.#tailEvents,
+      limits: LOG_LIMITS,
+      byKind,
+    }
+  }
+
+  #observe(action: string, fields: Record<string, unknown>): void {
+    console.log(JSON.stringify({ service: 'carpet-markets', component: 'durable-log', action, ...fields }))
   }
 
   async #mutate(
@@ -260,11 +391,15 @@ export class Floor extends DurableObject<Env> {
     state: { registry: Registry; chain: ChainSource },
   ): Promise<Response> {
     return this.#mutations.run(async () => {
+      if (this.env.CARPET_LOG_MODE === 'compact' && this.#authorityBlocked) {
+        return json({ error: this.#authorityBlocked.message }, this.#authorityBlocked.status)
+      }
       // Write-ahead is what makes a crash between receipt and application safe.
       // Failed mock blocks are atomic in MockLedger; quote/reply validation runs
       // before their cache writes. Those failures can therefore remove their
       // event without leaving accepted state that a cold replay would omit.
       const stored = await this.#append(input)
+      if ('refusal' in stored) return json({ error: stored.refusal.message }, stored.refusal.status)
       try {
         const response = await this.#apply(stored.event, state)
         if (response instanceof Response && (await responseFailure(response))) {
@@ -360,8 +495,17 @@ function expectedRejection(error: unknown): boolean {
 
 async function read<T>(request: Request): Promise<T> {
   try {
-    return (await request.json()) as T
-  } catch {
+    return JSON.parse(await readBoundedText(request)) as T
+  } catch (error) {
+    if (error instanceof ReplayLimitError) throw error
     throw new ListingError('That request was not JSON.')
   }
+}
+
+function rebuiltRequest(request: Request, body: string): Request {
+  return new Request(request.url, {
+    method: request.method,
+    headers: request.headers,
+    ...(request.method === 'GET' || request.method === 'HEAD' ? {} : { body }),
+  })
 }

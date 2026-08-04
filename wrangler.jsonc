@@ -30,7 +30,11 @@
   //
   // `mainnet` is refused by the Worker on boot. It is not a value to try.
   "vars": {
-    "CARPET_NETWORK": "mock"
+    "CARPET_NETWORK": "mock",
+    // Rollout phase 1. Deploy the checkpoint-aware binary once in `compat`,
+    // verify it, and make that version the rollback floor before a later config
+    // deployment changes this to `compact`. See NETWORK.md.
+    "CARPET_LOG_MODE": "compat"
   },
 
   // The chain and the market. One object, one name, so everybody trades against

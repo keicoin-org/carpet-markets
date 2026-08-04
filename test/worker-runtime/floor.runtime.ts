@@ -12,11 +12,17 @@ import { answer, call, nodeFor } from './helpers.js'
 const BUYER_SEED = '29'.repeat(32)
 const EVENT_PREFIX = 'event:v1:'
 const NEXT_SEQUENCE = 'meta:event-sequence:v1'
+const CHECKPOINT_POINTERS = 'meta:checkpoint:v2'
 
 interface StoredEvent {
   kind: string
   sequence: number
   status: 'pending' | 'accepted'
+}
+
+interface CheckpointPointers {
+  active: { generation: number; throughSequence: number }
+  previous?: { generation: number; throughSequence: number }
 }
 
 interface DurableSnapshot {
@@ -118,6 +124,19 @@ test('the configured FLOOR persists the seeded market, first trade, discovery, a
       await call(stub, '/market/reply', { asset, author: buyer.address, body, at, signature }),
     )
 
+    // Fill the measured replay boundary with ordinary signed blocks rather
+    // than cheap metadata alone: four sends and their four receives bring the
+    // accepted history to 15 events (seed + first-buy flow + eight payments).
+    const sink = await Kei.server({ seed: '30'.repeat(32), node: nodeFor(stub), network: 'mock' })
+    try {
+      for (let index = 0; index < 4; index += 1) {
+        await buyer.pay({ to: sink.address, amount: 0.001 })
+        await sink.sync()
+      }
+    } finally {
+      sink.close()
+    }
+
     const beforeEviction = await snapshot(stub, asset)
     expect(beforeEviction.book.asks).toHaveLength(0)
     expect(beforeEviction.holders).toContainEqual(
@@ -168,4 +187,64 @@ test('the configured FLOOR persists the seeded market, first trade, discovery, a
   } finally {
     buyer.close()
   }
+})
+
+test('the real runtime migrates v1, compacts atomically, evicts, and recovers from a damaged active generation', async () => {
+  const stub = env.FLOOR.get(env.FLOOR.idFromName('compaction-migration'))
+  const initial = await answer<MarketFacts>(await call(stub, '/market/facts'))
+
+  // The seed plus 15 accepted writes crosses the 8-event threshold twice.
+  // Unique watches preserve observable registry discovery while duplicate-watch
+  // folding is covered independently by the deterministic unit tests.
+  for (let index = 0; index < 15; index += 1) {
+    await answer(await call(stub, '/market/watch', { address: `kei_runtime_compaction_${index}` }))
+  }
+
+  const before = await answer<MarketFacts>(await call(stub, '/market/facts'))
+  const pointers = await runInDurableObject<Floor, CheckpointPointers>(stub, async (_instance, state) => {
+    const value = await state.storage.get<CheckpointPointers>(CHECKPOINT_POINTERS)
+    expect(value?.active.generation).toBe(2)
+    expect(value?.previous?.generation).toBe(1)
+    const v1 = await state.storage.list<StoredEvent>({ prefix: EVENT_PREFIX })
+    expect([...v1.values()].every((event) => event.sequence > value!.previous!.throughSequence)).toBe(true)
+    return value!
+  })
+
+  const beforeLimit = await eventLog(stub)
+  const sequenceBeforeLimit = await runInDurableObject<Floor, number>(stub, async (_instance, state) =>
+    state.storage.get<number>(NEXT_SEQUENCE).then((value) => value ?? -1),
+  )
+  const refused = await call(stub, '/market/watch', { address: 'kei_over_the_measured_replay_bound' })
+  expect(refused.status).toBe(507)
+  expect(await refused.json<{ error: string }>()).toMatchObject({
+    error: expect.stringMatching(/No ledger mutation was accepted/i),
+  })
+  expect(await eventLog(stub)).toEqual(beforeLimit)
+  await runInDurableObject<Floor, void>(stub, async (_instance, state) => {
+    expect(await state.storage.get<number>(NEXT_SEQUENCE)).toBe(sequenceBeforeLimit)
+  })
+
+  await evictDurableObject(stub)
+  const afterEviction = await answer<MarketFacts>(await call(stub, '/market/facts'))
+  expect(afterEviction.address).toBe(initial.address)
+  expect(afterEviction.listings.map((listing) => listing.asset)).toEqual(
+    before.listings.map((listing) => listing.asset),
+  )
+
+  // Corrupt only the active immutable generation. The predecessor plus its v1
+  // tail is still complete and must be selected on the next genuine cold boot.
+  await runInDurableObject<Floor, void>(stub, async (_instance, state) => {
+    const prefix = `checkpoint:v2:${pointers.active.generation.toString().padStart(8, '0')}:chunk:`
+    const chunks = await state.storage.list({ prefix })
+    const first = [...chunks.keys()][0]
+    expect(first).toBeDefined()
+    await state.storage.delete(first!)
+  })
+  await evictDurableObject(stub)
+
+  const recovered = await answer<MarketFacts>(await call(stub, '/market/facts'))
+  expect(recovered.address).toBe(initial.address)
+  expect(recovered.listings.map((listing) => listing.asset)).toEqual(
+    before.listings.map((listing) => listing.asset),
+  )
 })

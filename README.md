@@ -1,5 +1,9 @@
 # Carpet Markets
 
+Durable mock operation and recovery are documented in
+[`DURABLE_LOG.md`](./DURABLE_LOG.md). Read it before enabling log compaction: the
+first deployment is intentionally compatibility-only.
+
 A coin launchpad, in the pump.fun shape: anybody can launch a token in one click,
 whoever launched it is holding all of it, and from there it is worth whatever the
 next person will pay.
