@@ -11,6 +11,7 @@
  */
 
 import { expect, test } from 'bun:test'
+import { assertMatches, type Offer } from 'kei-transaction'
 
 import {
   advance,
@@ -82,6 +83,39 @@ test('a lost accept/cancel race is somebody else winning, not a failure to try h
   expect(recovery.retryable).toBe(false)
   expect(recovery.hint).toMatch(/nothing left your wallet/i)
 })
+
+test('an offer that is not the one on screen is named, and never offers a retry', () => {
+  // The SDK's own sentence rather than one this test wrote, so a change to its
+  // wording fails here instead of quietly falling through to `unknown` — which
+  // would put a "Try again" button under the one refusal that must not have one.
+  const message = refusal({ want: { asset: 'kei', symbol: 'KEI', name: 'Kei', decimals: 18, amount: 40 } })
+
+  const recovery = classify(message)
+  expect(recovery.kind).toBe('changed')
+  expect(recovery.retryable).toBe(false)
+  expect(recovery.hint).toMatch(/nothing was signed/i)
+  // Both numbers, which is what makes it a refusal somebody can act on.
+  expect(message).toContain('shown as 4')
+  expect(message).toContain('the chain says 40')
+})
+
+/** The message `market.accept` throws when the chain disagrees with the screen. */
+function refusal(chain: Partial<Offer>): string {
+  const shown = {
+    hash: 'F'.repeat(64),
+    from: 'kei_seller',
+    give: { asset: 'asset-carpet', symbol: 'CARPET', name: 'Carpet', decimals: 0, amount: 1_000 },
+    want: { asset: 'kei', symbol: 'KEI', name: 'Kei', decimals: 18, amount: 4 },
+    to: null,
+  } as Offer
+
+  try {
+    assertMatches({ ...shown, ...chain }, { ...shown, seller: shown.from })
+    throw new Error('The SDK accepted terms that had moved.')
+  } catch (error) {
+    return (error as Error).message
+  }
+}
 
 test('an unsettled receivable is told apart from an empty wallet', () => {
   expect(classify('That is still a receivable and has not been received yet.').kind).toBe('sync')

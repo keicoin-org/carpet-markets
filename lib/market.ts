@@ -24,6 +24,7 @@ import {
   KeiError,
   seedStoreKey,
   type AssetInfo,
+  type Expectation,
   type Offer,
   type Settlement,
   type Trade,
@@ -118,8 +119,23 @@ export interface Trader {
    * rather than something the page pretends is always available.
    */
   bid(asset: string, amount: number, unitPrice: number): Promise<Offer>
-  /** Take somebody's offer. One block, both legs or neither (SPEC §9.2). */
-  accept(offer: string): Promise<Settlement>
+  /**
+   * Take somebody's offer. One block, both legs or neither (SPEC §9.2).
+   *
+   * `expect` is the terms the screen drew, and it is required rather than
+   * optional on purpose. Every number in the book arrived from the registry,
+   * which is an index and never an authority (SPEC §9.4): it can attach the
+   * hash of one offer to the price and quantity of another, and a wallet that
+   * signs the hash it was handed pays for the wrong thing at the right price.
+   * The SDK re-reads the offer from the chain and checks every field of both
+   * legs against this immediately before signing, so a book that has gone stale
+   * between the poll and the click refuses instead of settling.
+   *
+   * Build it at the call site from the same object the row rendered. An
+   * expectation derived from anything else is a check that passes by
+   * construction, which is worse than no check because it reads as one.
+   */
+  accept(offer: string, expect: Expectation): Promise<Settlement>
   /** Take back your own unaccepted offer, and the coins with it. */
   cancel(offer: string): Promise<void>
   /** This wallet's own open offers, across every coin. */
@@ -237,7 +253,7 @@ export async function connect(): Promise<Trader> {
       return kei.market.bid({ asset, amount, price: amount * unitPrice })
     },
 
-    accept: (offer) => kei.market.accept(offer),
+    accept: (offer, expect) => kei.market.accept(offer, { expect }),
 
     async cancel(offer) {
       await kei.market.cancel(offer)

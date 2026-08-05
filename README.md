@@ -214,6 +214,14 @@ Everything it reports is read back off the chain. A reader with the same list of
 accounts gets the same answer without asking this server anything, which is the
 property worth having and the reason it is an index rather than an oracle.
 
+The client enforces that rather than assuming it. Every number in the book
+reaches the screen through this server, and an index can attach the hash of one
+offer to the price and quantity of another — by a bug, by a stale cache, or on
+purpose. So a Buy carries the terms the row rendered into `market.accept`, the
+SDK re-reads the offer from the chain and checks every field of both legs against
+them, and a disagreement refuses before anything is signed. This server does not
+need the key if it can choose which offer the key signs for; it cannot.
+
 ## No balance database
 
 There is no `users` table, no `balances` table, no `holdings` table, and no save

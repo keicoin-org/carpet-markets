@@ -15,7 +15,7 @@
 
 import { expect, mock, test } from 'bun:test'
 import type { ReactNode } from 'react'
-import type { Offer } from 'kei-transaction'
+import type { Expectation, Offer } from 'kei-transaction'
 
 mock.module('next/link', () => ({
   default: ({ href, children, ...rest }: { href: unknown; children: ReactNode }) => (
@@ -43,6 +43,7 @@ const { METRICS, metric } = await import('../lib/metrics.js')
 const { NO_FUNDS } = await import('../lib/balance.js')
 const { FEED_OPENING } = await import('../lib/feed.js')
 const { caveat } = await import('../shared/caveats.js')
+const { KEI_RAW } = await import('../shared/format.js')
 const { MarketStateProvider } = await import('../lib/use-market.js')
 
 import type { MetricContext } from '../lib/metrics'
@@ -256,6 +257,44 @@ test('a soulbound coin renders no trade controls at all, rather than disabled on
     </MarketStateProvider>,
   )
   expect(view.name(view.find('tbody button'))).toContain('soulbound')
+  view.unmount()
+})
+
+test('the Buy button hands the wallet the terms the row rendered, not just a hash', () => {
+  const row = offer()
+  const taken: { hash?: string; expect?: Expectation } = {}
+
+  const view = render(
+    <MarketStateProvider
+      value={market({
+        funds: { ...NO_FUNDS, confirmed: 100n * KEI_RAW },
+        trader: {
+          address: YOU,
+          accept: (hash: string, expected: Expectation) => {
+            taken.hash = hash
+            taken.expect = expected
+            return Promise.resolve()
+          },
+        },
+        act: (_kind: unknown, _what: unknown, job: () => Promise<void>) => job(),
+      })}
+    >
+      <Ladder side="ask" listing={LISTING} offers={[row]} held={0} loading={false} onTraded={() => {}} />
+    </MarketStateProvider>,
+  )
+
+  const button = view.find<HTMLButtonElement>('tbody button')
+  expect(button.getAttribute('aria-disabled')).toBe('false')
+  view.click(button)
+
+  // The two numbers the row printed, carried into the signature. Without them
+  // the wallet signs whatever the registry attached that hash to.
+  expect(view.name(button)).toContain('1,000 CARPET')
+  expect(taken.hash).toBe(row.hash)
+  expect(taken.expect?.hash).toBe(row.hash)
+  expect(taken.expect?.seller).toBe(row.from)
+  expect(taken.expect?.give?.amount).toBe(1_000)
+  expect(taken.expect?.want?.amount).toBe(0.5)
   view.unmount()
 })
 
