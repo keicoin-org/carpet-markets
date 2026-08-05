@@ -405,11 +405,25 @@ layout engine there, so `scrollWidth` is a fiction and a focus ring is a class
 name nobody drew. It prints the click count, the measured widths and the focus
 ring at every stop, and exits non-zero if any of the three does not hold.
 
-It is not a CI job, because as of this commit it exits non-zero honestly: only
-criterion 5 holds. Criterion 1 stops on an unaffordable first lot and criterion 6
-stops where a settled sell does not put "Your open orders" on the page, so there
-is nothing to cancel by keyboard. Both are #18. A red job nobody can fix teaches
-people to ignore the job, so this stays a command until its criteria pass.
+It is not a CI job, because as of this commit it still exits non-zero. Run on this
+branch against Chrome 141, one of the three holds and it is the one this change is
+about:
+
+```
+PASS  criterion 1 — a first buy in 4 interactions, with every funnel step announced in order
+      1. buyable now  2. opened KILIM  3. Buy 8,000 KILIM for 7.2 Kei  4. Confirm the buy
+FAIL  criterion 5 — the network page's primary action is not found at 360 px
+      no page scrolls horizontally; three of the four expose a primary action
+FAIL  criterion 6 — "Your open orders" never appeared after a settled sell
+1 of 3 checked criteria hold. Unmet: 5, 6.
+```
+
+Criterion 1 is what this branch bought: it stopped on the unaffordable lot before,
+and the row it takes now is the 7.2 Kei clip added to the board. Criterion 6 stops
+on #25, not on anything here — a seller whose order is not listed has no route to
+the cancel that unlocks the units. Criterion 5 stops on the network page alone. A
+red job nobody can fix teaches people to ignore the job, so this stays a command
+until its criteria pass.
 
 It installs no browser. `puppeteer-core` drives whichever Chrome is already on
 the machine; set `CHROME_PATH` if it is somewhere unusual.
