@@ -85,7 +85,7 @@ The site never claims a coin is safe. It shows you what was issued.
 |---|---|
 | **Launch** | Name a coin, pick who may move it, pay the fee. You are minted the whole supply. |
 | **Sell** | Write an offer: how many, and what you want for them. The coins lock until it settles or you cancel. |
-| **Buy** | Accept somebody's offer. One block, both legs, or neither. |
+| **Buy** | Take somebody's offer, after the terms are restated. One block, both legs, or neither. |
 | **Bid** | The mirror of selling: lock Kei, and take the coins from whoever fills it. The only way to be a buyer when nobody is selling. |
 | **Cancel** | Take back your own unaccepted order, and whatever it locked. |
 
@@ -102,6 +102,37 @@ The trap that comes with it, which cost an afternoon: **`Offer.price` is
 and puts a spike into a chart of fractions. `unitPrice()` in `shared/listing.ts`
 is the one place that is undone, and `test/pricing.test.ts` is why it is allowed
 to be the only one.
+
+### A first buy is five steps, and they are a state machine
+
+A stranger's first buy passes through five states, in order, and the order is
+enforced in `lib/funnel.ts` rather than afforded by the layout:
+
+| | |
+|---|---|
+| **nothing for sale** | No trades yet and no reserve. Somebody has to write an offer before there is anything to take, and the panel says so rather than greying out a price field. |
+| **pick a quote** | The book. Every row is one account's offer at its own price, so picking one is choosing a counterparty. |
+| **confirm the terms** | What the offer hands over, what it costs, per unit, and from whom — restated before anything is signed. |
+| **settling** | The block is out and no read has seen it. Its own step, not a spinner inside a button. |
+| **settled** | A read has seen it. The only step in which a buy is a fact. |
+
+`chose` is the only way into the third and `confirmed` is the only way into the
+fourth, so there is no path from a row straight to a signature: a panel that
+dropped the confirmation could not sign either. The poll cannot rewind any of
+them — an ask filled by somebody else while a confirmation is on screen leaves it
+where it is. `test/funnel.test.ts` is every transition, including the ones that
+must do nothing.
+
+The confirmation costs one interaction, which puts the path from the board at
+four — narrow to what is buyable, open a coin, take a row, confirm — against
+SPEC §9.6 criterion 1's budget of five.
+
+That is the click count, and it is not the same claim as a stranger getting
+through. `bun run walk` counts the interactions in a real browser, and it does
+not currently reach a settled buy: the faucet hands a new wallet 25 Kei and the
+cheapest lot on the first buyable coin costs 66. The funnel says so in the row's
+own words instead of failing at the signature, but an affordable first lot is a
+board problem rather than a funnel one, and it is open as #18.
 
 ### There is no curve, deliberately
 
@@ -150,6 +181,7 @@ worker/index.ts         the same two, on Cloudflare, in one Durable Object.
 lib/market.ts           every line of Kei in the client.
 lib/balance.ts          confirmed, incoming and in-flight money, kept apart.
 lib/tx.ts               what became of a signature, and whether a retry is honest.
+lib/funnel.ts           the five states a first buy passes through, in order.
 lib/refusals.ts         every reason a trade will not go through, worked out first.
 lib/board.ts            the board's sorts and filters, as arithmetic.
 lib/use-market.tsx      the wallet, the poll, and where React finds out about them.
@@ -160,6 +192,7 @@ app/network/page.tsx    what is under the page, at length.
 components/             the board's parts, including the woven coin marks.
 scripts/testnet-probe.ts  whether a given node can carry this market.
 scripts/seed.ts         a board worth looking at, made out of ordinary blocks.
+scripts/walk.ts         the three acceptance criteria that need a real browser.
 spawn.ts                running a command on an OS that disagrees what one is.
 ```
 
@@ -350,7 +383,26 @@ installed now fails saying which one, rather than as an errno from libuv.
 
 ```sh
 bun run check     # typecheck, worker typecheck, and the tests
+bun run walk      # the three acceptance criteria that need a browser
 ```
+
+`bun run walk` starts the chain, the registry and the client, seeds the board out
+of ordinary blocks, and drives Chrome through the demo. It exists because three
+of SPEC §9.6's nine criteria — a buy in five interactions, no horizontal scroll at
+360 px, and the whole loop by keyboard — are claims about layout, focus and a
+click count, and none of them survives being asserted in happy-dom: there is no
+layout engine there, so `scrollWidth` is a fiction and a focus ring is a class
+name nobody drew. It prints the click count, the measured widths and the focus
+ring at every stop, and exits non-zero if any of the three does not hold.
+
+It is not a CI job, because as of this commit it exits non-zero honestly: only
+criterion 5 holds. Criterion 1 stops on an unaffordable first lot and criterion 6
+stops where a settled sell does not put "Your open orders" on the page, so there
+is nothing to cancel by keyboard. Both are #18. A red job nobody can fix teaches
+people to ignore the job, so this stays a command until its criteria pass.
+
+It installs no browser. `puppeteer-core` drives whichever Chrome is already on
+the machine; set `CHROME_PATH` if it is somewhere unusual.
 
 `test/registry.test.ts` is where the claim on the badge is either true or
 marketing. It asserts at the ledger that a soulbound coin cannot be offered at
@@ -363,6 +415,12 @@ does not move as coins pile up.
 that can refuse a trade gets its own sentence, and the one that would otherwise
 be a lie — arrived-but-unsigned-for money reported as "not enough Kei" — is
 tested apart from the one that is true.
+
+`test/funnel.test.ts` is the first-buy path as a state machine, transition by
+transition, including the ones that must do nothing: the book cannot sign, a
+chosen quote cannot land without being confirmed, and a poll cannot rewind a
+block in flight. `test/screen.test.tsx` then asserts the same five steps reach
+the screen, in order, with `settling` provably on it before `settled`.
 
 `test/tx.test.ts` is the state machine a signature moves through, and the two
 rules in it that would cost somebody money: a policy refusal never offers a

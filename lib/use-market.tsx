@@ -48,6 +48,21 @@ export interface Effect {
   coins?: Iterable<readonly [string, number]>
 }
 
+/**
+ * What became of one signed action, for a caller that has a next step.
+ *
+ * The tray is where a person reads this; `lib/funnel.ts` is why it is also a
+ * return value. A funnel that moved to `settled` because `act` resolved would be
+ * calling a block in flight a fact — and one that moved there after a refusal
+ * would be worse. `signed` is false when the wallet was busy and nothing was
+ * attempted, which is neither.
+ */
+export interface Outcome {
+  signed: boolean
+  /** The ledger's own sentence, or null when a read has seen the action land. */
+  problem: string | null
+}
+
 interface MarketState {
   trader: Trader | null
   /** Set only if the wallet could not be opened at all. */
@@ -73,7 +88,7 @@ interface MarketState {
   /** Everything signed recently, with what became of it. */
   log: Tx[]
   /** Run one signed action, keeping the page honest about what is happening. */
-  act(kind: TxKind, what: string, job: () => Promise<void>, effect?: Effect): Promise<void>
+  act(kind: TxKind, what: string, job: () => Promise<void>, effect?: Effect): Promise<Outcome>
   /** Do it again. Only offered where `lib/tx.ts` says a retry is honest. */
   retry(id: number): Promise<void>
   dismiss(id: number): void
@@ -218,7 +233,14 @@ export function MarketProvider({ children }: { children: ReactNode }) {
    * fact, and only the third is allowed to be phrased as one.
    */
   const run = useCallback(
-    async (id: number, kind: TxKind, what: string, job: () => Promise<void>, effect?: Effect, attempt = 1) => {
+    async (
+      id: number,
+      kind: TxKind,
+      what: string,
+      job: () => Promise<void>,
+      effect?: Effect,
+      attempt = 1,
+    ): Promise<Outcome> => {
       busyRef.current = true
       setBusy(true)
       setLog((current) => [...current.filter((tx) => tx.id !== id), begin(id, kind, what, Date.now(), attempt)])
@@ -255,14 +277,15 @@ export function MarketProvider({ children }: { children: ReactNode }) {
           setBusy(false)
         }
       }
+      return { signed: true, problem: broke }
     },
     [refresh],
   )
 
   const act = useCallback(
-    async (kind: TxKind, what: string, job: () => Promise<void>, effect?: Effect) => {
-      if (busyRef.current) return
-      await run(++ticket.current, kind, what, job, effect)
+    async (kind: TxKind, what: string, job: () => Promise<void>, effect?: Effect): Promise<Outcome> => {
+      if (busyRef.current) return { signed: false, problem: null }
+      return run(++ticket.current, kind, what, job, effect)
     },
     [run],
   )
