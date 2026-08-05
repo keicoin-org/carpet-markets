@@ -90,4 +90,10 @@ test('a settled ticker is still refused after its intent is long gone', async ()
   // The intent was consumed by the settlement, so this is the settled-coin check
   // doing its original job — the new one must not have replaced it.
   await expect(registry.quoteLaunch(bob.address, identity('WARP'))).rejects.toThrow(/already listed here/)
-})
+  // Longer than the 15s deadline above, because bun's default is 5s and a
+  // deadline the runner never lets you reach is not a deadline. This is the one
+  // case here that waits on a real settlement — a payment, the registry noticing
+  // it, and an issuance with its proof-of-work — and on a loaded runner that is
+  // comfortably past five seconds. The rest of the suite already carries
+  // explicit timeouts for the same reason.
+}, 30_000)
