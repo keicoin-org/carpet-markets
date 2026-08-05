@@ -31,6 +31,7 @@ import {
 } from 'kei-transaction'
 
 import type { Book, Holder, LaunchQuote, MarketFacts, TransferPolicy } from '../shared/listing'
+import { FAUCET_KEI } from '../shared/faucet'
 import { cleanReply, replyHash, type Reply } from '../shared/social'
 
 /**
@@ -155,7 +156,7 @@ export async function connect(): Promise<Trader> {
 
   // A visitor arriving at an empty wallet can do nothing at all, and this is a
   // chain where an empty wallet costs nothing to fill.
-  if ((await kei.balance()) <= 0) await kei.faucet(25).catch(() => undefined)
+  if ((await kei.balance()) <= 0) await kei.faucet(FAUCET_KEI).catch(() => undefined)
 
   // The registry cannot see a settlement it was not part of, so a wallet that
   // intends to trade says so once. Everything it writes after this is readable
@@ -280,7 +281,7 @@ export async function connect(): Promise<Trader> {
     },
 
     async topUp() {
-      await kei.faucet(25)
+      await kei.faucet(FAUCET_KEI)
     },
   }
 }

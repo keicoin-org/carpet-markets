@@ -20,6 +20,7 @@
  * each sentence is asserted in `test/refusals.test.ts` rather than trusted.
  */
 
+import { FAUCET_GRANT_RAW, FAUCET_KEI } from '../shared/faucet'
 import { formatCoins, formatKei } from '../shared/format'
 import type { Listing } from '../shared/listing'
 import { spendable, spendableCoins, type Funds } from './balance'
@@ -66,6 +67,23 @@ const badAmount = (listing: Listing): Blocker =>
     `That is not a number of ${listing.symbol}.`,
     'Digits, and at most one decimal point. No commas, spaces or minus signs — a separator that means a thousand here means a half somewhere else, so this asks rather than assumes.',
   )
+
+/**
+ * How to cover a shortfall from the bar, counted in presses.
+ *
+ * The gap used to be reported with a flat "the faucet hands out 25 Kei", which
+ * left somebody looking at a 66 Kei lot to work out on their own that the answer
+ * was to press it three times (#18). Naming the count is the same rule the rest
+ * of this file follows: say what the state is and say what to do about it, before
+ * the click rather than after it.
+ *
+ * Rounded up, because two thirds of a grant is not something the faucet pays.
+ */
+function fromTheFaucet(short: bigint): string {
+  const presses = (short + FAUCET_GRANT_RAW - 1n) / FAUCET_GRANT_RAW
+  const count = presses <= 1n ? 'once' : `${presses} times`
+  return `The faucet in the bar hands out ${FAUCET_KEI} Kei a press, and this chain is one where that is free — press it ${count}.`
+}
 
 /**
  * Why this coin has no market at all, or null when it has one.
@@ -149,7 +167,7 @@ export function buyBlocker(context: BuyContext): Blocker | null {
   return blocker(
     'short',
     `That costs ${formatKei(total, 4)} Kei and ${formatKei(now, 4)} is spendable.`,
-    'The faucet in the bar hands out 25 Kei, and this chain is one where that is free.',
+    fromTheFaucet(total - now),
   )
 }
 
@@ -368,6 +386,6 @@ export function launchBlocker(context: LaunchContext): Blocker | null {
   return blocker(
     'short',
     `Launching costs ${formatKei(fee, 4)} Kei and ${formatKei(now, 4)} is spendable.`,
-    'The faucet in the bar hands out 25 Kei.',
+    fromTheFaucet(fee - now),
   )
 }

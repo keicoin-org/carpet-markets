@@ -23,6 +23,8 @@
 
 import { MockNode, mockRpcHandler, type KeiNode, type NetworkName } from 'kei-transaction'
 
+import { FAUCET_KEI } from '../shared/faucet.js'
+
 import {
   NETWORKS,
   PUBLIC_TESTNET_RPC,
@@ -73,7 +75,7 @@ export async function openChain(config: ChainConfig = {}): Promise<ChainSource> 
     }
   }
 
-  const node = await MockNode.create({ faucetAmount: config.faucetAmount ?? 25 })
+  const node = await MockNode.create({ faucetAmount: config.faucetAmount ?? FAUCET_KEI })
   const handler = mockRpcHandler({ node })
   return {
     node,

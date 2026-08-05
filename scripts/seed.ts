@@ -20,7 +20,8 @@ import { keyPairFromSeed, signHash } from '@keicoin/core'
 import { Kei, randomSeed } from 'kei-transaction'
 
 import { cleanReply, replyHash } from '../shared/social.js'
-import type { LaunchQuote, MarketFacts, TransferPolicy } from '../shared/listing.js'
+import { DEMO_BOARD } from '../shared/demo-board.js'
+import type { LaunchQuote, MarketFacts } from '../shared/listing.js'
 
 const argv = Bun.argv.slice(2)
 const flag = (name: string): string | undefined => {
@@ -30,97 +31,6 @@ const flag = (name: string): string | undefined => {
 
 const API = (flag('api') ?? 'http://localhost:7788').replace(/\/$/, '')
 const RPC = `${API}/rpc`
-
-interface Plan {
-  symbol: string
-  name: string
-  blurb: string
-  transfer: TransferPolicy
-  /** Fractions of the supply the creator lists, in order, each at its own price. */
-  asks: { units: number; each: number }[]
-  /** How many of those asks somebody takes. */
-  filled: number
-  bids: { units: number; each: number }[]
-  replies: string[]
-}
-
-/**
- * Six coins that between them cover every state the board can be in.
- *
- * Chosen for coverage rather than for jokes: one never traded, one mid-dump, one
- * with both sides quoted, one soulbound, one issuer-only, one with nothing for
- * sale but a price in its history. A board where every card looks the same
- * proves nothing about the cards.
- */
-const PLAN: Plan[] = [
-  {
-    symbol: 'KILIM',
-    name: 'Kilim',
-    blurb: 'Flat-woven, reversible, and so is the position.',
-    transfer: 'open',
-    asks: [
-      { units: 40_000, each: 0.0004 },
-      { units: 25_000, each: 0.0006 },
-      { units: 60_000, each: 0.0011 },
-    ],
-    filled: 2,
-    bids: [{ units: 20_000, each: 0.0003 }],
-    replies: ['weaving, not selling', 'the creator has moved 65k units. it is on the chart.'],
-  },
-  {
-    symbol: 'UNDERLAY',
-    name: 'Underlay',
-    blurb: 'Nobody thinks about it until they are standing on nothing.',
-    transfer: 'open',
-    asks: [{ units: 300_000, each: 0.00008 }],
-    filled: 1,
-    bids: [
-      { units: 50_000, each: 0.00005 },
-      { units: 120_000, each: 0.00003 },
-    ],
-    replies: ['300k in one clip. that is a third of the supply.'],
-  },
-  {
-    symbol: 'FRINGE',
-    name: 'Fringe',
-    blurb: 'The part that frays first.',
-    transfer: 'open',
-    asks: [{ units: 5_000, each: 0.002 }],
-    filled: 0,
-    bids: [],
-    replies: [],
-  },
-  {
-    symbol: 'WARP',
-    name: 'Warp',
-    blurb: 'Traded once, and nobody is offering since.',
-    transfer: 'open',
-    asks: [{ units: 10_000, each: 0.00035 }],
-    filled: 1,
-    bids: [],
-    replies: [],
-  },
-  {
-    symbol: 'HEIRLOOM',
-    name: 'Heirloom',
-    blurb: 'Soulbound. It cannot be sold, by anybody, including whoever made it.',
-    transfer: 'none',
-    asks: [],
-    filled: 0,
-    bids: [],
-    replies: ['this one genuinely cannot be dumped on you. the ledger says so.'],
-  },
-  {
-    symbol: 'BAZAAR',
-    name: 'Bazaar Credit',
-    blurb: 'Issuer-only. Whatever market it has, the issuer is the whole of it.',
-    transfer: 'issuer-only',
-    asks: [],
-    filled: 0,
-    bids: [],
-    replies: [],
-  },
-]
 
 async function api<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(`${API}${path}`, {
@@ -171,7 +81,7 @@ await buyer.faucet(400)
 await buyer.sync()
 await api('/market/watch', { address: buyer.address })
 
-for (const plan of PLAN) {
+for (const plan of DEMO_BOARD) {
   const creatorSeed = randomSeed()
   const creator = await Kei.server({ seed: creatorSeed, node: RPC, network: 'mock' })
   await creator.faucet(60)

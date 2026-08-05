@@ -20,7 +20,8 @@
 
 import Link from 'next/link'
 
-import { KEI_RAW, formatKei, shortAddress } from '../shared/format'
+import { formatKei, shortAddress } from '../shared/format'
+import { FAUCET_GRANT_RAW, FAUCET_KEI } from '../shared/faucet'
 import { projected, spendable, settling } from '../lib/balance'
 import { useMarket } from '../lib/use-market'
 import { FeedStatus } from './FeedStatus'
@@ -76,9 +77,9 @@ export function Header() {
             type="button"
             className="btn-quiet px-2 py-1 text-xs"
             disabled={busy || !trader}
-            title="Twenty-five Kei from a faucet, on a chain where Kei is worth nothing."
+            title={`${FAUCET_KEI} Kei from a faucet, on a chain where Kei is worth nothing.`}
             onClick={() =>
-              void act('faucet', 'Topping up', () => trader?.topUp() ?? Promise.resolve(), { kei: 25n * KEI_RAW })
+              void act('faucet', 'Topping up', () => trader?.topUp() ?? Promise.resolve(), { kei: FAUCET_GRANT_RAW })
             }
           >
             Faucet
