@@ -22,11 +22,13 @@ import {
   NEXT_SEQUENCE,
   ReplayLimitError,
   canonicalEvents,
+  countingStorage,
   eventBytes,
   eventKey,
   loadLog,
   logSize,
   measureRawUsage,
+  noStorageWork,
   processBlockIdentity,
   processInputIdentity,
   rawLimitError,
@@ -37,7 +39,9 @@ import {
   type CheckpointManifest,
   type EventInput,
   type LoadedLog,
+  type LogStorage,
   type LogUsage,
+  type StorageWork,
   type StoredEvent,
 } from './durable-log.js'
 
@@ -87,6 +91,8 @@ export class Floor extends DurableObject<Env> {
   #acceptanceBlocked: ReplayLimitError | undefined
   /** Persisted `event:v1:*` rows and bytes, measured from storage. */
   #rawUsage: LogUsage = { events: 0, bytes: 0 }
+  /** Storage work done by the mutation currently being written. */
+  #work: StorageWork = noStorageWork()
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
@@ -479,6 +485,11 @@ export class Floor extends DurableObject<Env> {
   async #append(
     input: EventInput,
   ): Promise<{ key: string; event: StoredEvent } | { refusal: ReplayLimitError }> {
+    // One mutation, one total. Reset here rather than in #accept because
+    // admission's own storage read is part of what a mutation costs, and a
+    // refused mutation should not leave its reads on the next one's bill.
+    this.#work = noStorageWork()
+    const counted = this.#countedStorage()
     // Admission happens outside storage.transaction(). Workerd treats an error
     // escaping a transaction callback as an aborted storage turn even when the
     // caller later catches it. The mutation queue makes this projection stable,
@@ -496,14 +507,14 @@ export class Floor extends DurableObject<Env> {
       // drops every row an activated checkpoint covers, so canonical history
       // cannot see the rows a failed cleanup left behind. Storage can, and it
       // is the only measure that survives eviction with them.
-      this.#rawUsage = await measureRawUsage(this.ctx.storage)
+      this.#rawUsage = await measureRawUsage(counted)
       const rawRefusal = rawLimitError({
         events: this.#rawUsage.events + 1,
         bytes: this.#rawUsage.bytes + eventBytes(projected),
       })
       if (rawRefusal) return { refusal: rawRefusal }
     }
-    const stored = await this.ctx.storage.transaction(async (storage) => {
+    const stored = await counted.transaction(async (storage) => {
       const sequence = (await storage.get<number>(NEXT_SEQUENCE)) ?? 0
       const event = { version: 1 as const, sequence, status: 'pending' as const, ...input } as StoredEvent
       const key = eventKey(sequence)
@@ -522,8 +533,12 @@ export class Floor extends DurableObject<Env> {
   async #accept(event: StoredEvent): Promise<void> {
     const accepted = { ...event, status: 'accepted' as const }
     const key = eventKey(event.sequence)
-    await this.ctx.storage.put(key, accepted)
-    const persisted = await this.ctx.storage.get<StoredEvent>(key)
+    // Same counter #append opened. The status rewrite and the read-back that
+    // proves it landed are storage work this mutation did, so they are on its
+    // bill; the reset belongs to whoever starts the mutation, not here.
+    const counted = this.#countedStorage()
+    await counted.put(key, accepted)
+    const persisted = await counted.get<StoredEvent>(key)
     if (JSON.stringify(persisted) !== JSON.stringify(accepted)) {
       throw new Error(`Durable WAL row ${key} did not retain its accepted status.`)
     }
@@ -545,10 +560,15 @@ export class Floor extends DurableObject<Env> {
       kind: accepted.kind,
       acceptedBytes: bytes,
       acceptedBytesLastMinute: this.#acceptedWindow.reduce((total, entry) => total + entry.bytes, 0),
-      storageOperations: 3,
-      storageKeyWrites: 3,
+      // Counted through `countingStorage`, not asserted. These were the literal
+      // 3 and 3 — a figure read off `#append` and `#accept` once, already wrong
+      // and structurally unable to notice a later change to either method.
+      storageOperations: this.#work.operations,
+      storageKeyWrites: this.#work.keyWrites,
       // Compact-mode admission reads the persisted v1 prefix once before it
       // allocates anything, so raw pressure is storage's answer, not memory's.
+      // It is inside `storageOperations` above; this names it separately because
+      // it is the one operation an operator can remove by leaving compact mode.
       admissionListReads: this.env.CARPET_LOG_MODE === 'compact' ? 1 : 0,
       ...this.#measure(),
     })
@@ -671,6 +691,18 @@ export class Floor extends DurableObject<Env> {
         ...this.#measure(),
       })
     }
+  }
+
+  /**
+   * This object's storage, with every call added to the current mutation's bill.
+   *
+   * Only the write path uses it. Replay, compaction and cleanup have their own
+   * measured figures (`replayMs`, `compactionMs`, `rawEvents`), and putting their
+   * operations in the same counter would make "per accepted mutation" mean
+   * something different on the mutation that happened to trigger a compaction.
+   */
+  #countedStorage(): LogStorage {
+    return countingStorage(this.ctx.storage, this.#work)
   }
 
   #measure(): Record<string, unknown> {

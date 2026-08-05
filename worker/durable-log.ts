@@ -105,6 +105,14 @@ export interface LoadedLog {
 interface LogTransaction {
   put<T>(key: string, value: T): Promise<void>
   put<T>(entries: Record<string, T>): Promise<void>
+  /**
+   * A transaction reads as well as writes — `#append` allocates its sequence
+   * from inside one. Naming it here is what lets a counted storage stand in for
+   * the real one: a wrapper can only forward the calls the type admits the
+   * closure may make, and a closure whose read went uncounted is the same silent
+   * under-report this counting exists to remove.
+   */
+  get<T = unknown>(key: string): Promise<T | undefined>
 }
 
 export interface LogStorage extends LogTransaction {
@@ -113,6 +121,78 @@ export interface LogStorage extends LogTransaction {
   list<T = unknown>(options?: { prefix?: string }): Promise<Map<string, T>>
   delete(keys: string[]): Promise<number>
   transaction<T>(closure: (transaction: LogTransaction) => Promise<T>): Promise<T>
+}
+
+/** Storage work, counted as it happens rather than asserted from the code. */
+export interface StorageWork {
+  /** Calls that reach the Durable Object storage API. */
+  operations: number
+  /** Individual keys written or deleted by them. */
+  keyWrites: number
+}
+
+export function noStorageWork(): StorageWork {
+  return { operations: 0, keyWrites: 0 }
+}
+
+/**
+ * `storage`, with every call it receives added to `work`.
+ *
+ * Issue #8 asks for storage reads/writes and rows per accepted mutation. The
+ * first version of this metric reported the constant 3 for both — a number
+ * somebody arrived at by reading `#append` and `#accept` once. It was already
+ * wrong for operations (there are four, and five in compact mode, where
+ * admission lists the persisted prefix before it allocates anything), and being
+ * a literal it would have stayed both wrong and plausible through any later
+ * change to either method.
+ *
+ * So it is counted where it happens. A `put` of a record is one operation and
+ * one key write per key, because that is what it costs; a transaction counts
+ * its own call plus whatever the closure does inside it.
+ *
+ * The counter is deliberately not reset here. A mutation resets it once, before
+ * it starts writing, and every call the write path makes after that lands in the
+ * same total — which is what makes the reported figure "per accepted mutation"
+ * rather than per method.
+ */
+export function countingStorage(storage: LogStorage, work: StorageWork): LogStorage {
+  const countPut = (keyOrEntries: unknown): void => {
+    work.operations += 1
+    work.keyWrites += typeof keyOrEntries === 'string' ? 1 : Object.keys(keyOrEntries as object).length
+  }
+  const put = (target: LogTransaction): LogTransaction['put'] =>
+    (async (keyOrEntries: unknown, value?: unknown) => {
+      countPut(keyOrEntries)
+      return typeof keyOrEntries === 'string'
+        ? target.put(keyOrEntries, value)
+        : target.put(keyOrEntries as Record<string, unknown>)
+    }) as LogTransaction['put']
+  // Typed on the narrow single-key `get` a transaction offers, because that is
+  // the shape both callers satisfy: storage's overloaded `get` is assignable to
+  // it, and the cast on the way out restores the array form storage really has.
+  const get = (target: Pick<LogTransaction, 'get'>): LogStorage['get'] =>
+    (async (keys: string | string[]) => {
+      work.operations += 1
+      return target.get(keys as string)
+    }) as LogStorage['get']
+
+  return {
+    put: put(storage),
+    get: get(storage),
+    list: async (options) => {
+      work.operations += 1
+      return storage.list(options)
+    },
+    delete: async (keys) => {
+      work.operations += 1
+      work.keyWrites += keys.length
+      return storage.delete(keys)
+    },
+    transaction: async (closure) => {
+      work.operations += 1
+      return storage.transaction(async (inner) => closure({ put: put(inner), get: get(inner) }))
+    },
+  }
 }
 
 export class ReplayLimitError extends Error {
