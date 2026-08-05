@@ -366,13 +366,25 @@ function complaint(input: { symbol: string; name: string; blurb: string }): stri
  *
  * Polls the registry rather than the provider's copy, because this runs inside
  * the action and the provider's next refresh is behind it.
+ *
+ * Matched on the creator as well as the ticker. Matching on the ticker alone
+ * meant `find` returned whichever coin with that symbol settled first, so a
+ * launcher who paid for the second DOGE was sent to the first one's page — their
+ * fee spent, their supply elsewhere, and no link on screen to the coin they
+ * actually made (#17). The registry now refuses a ticker somebody is mid-payment
+ * on, which closes the way two of them arise here; the chain still permits two,
+ * because asset ids are derived per issuer (SPEC §5.6.1), so the thing that
+ * navigates should not be a string the user chose.
  */
 async function appear(trader: Trader, symbol: string): Promise<Listing | null> {
   const deadline = Date.now() + APPEARS_WITHIN_MS
   for (;;) {
     const listed = await trader
       .facts()
-      .then((next) => next.listings.find((listing) => listing.symbol === symbol) ?? null)
+      .then(
+        (next) =>
+          next.listings.find((listing) => listing.symbol === symbol && listing.creator === trader.address) ?? null,
+      )
       .catch(() => null)
     if (listed) return listed
     if (Date.now() > deadline) return null
