@@ -15,7 +15,7 @@
 
 import type { Offer, PriceSummary, Trade } from 'kei-transaction'
 
-import type { NetworkFacts } from './network.js'
+import type { NetworkFacts } from './network'
 
 /**
  * Who may move a coin's units, chosen at issuance and immutable after

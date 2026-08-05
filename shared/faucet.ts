@@ -18,7 +18,7 @@
  * the mock and not on the chain the deployed demo talks to.
  */
 
-import { KEI_RAW } from './format.js'
+import { KEI_RAW } from './format'
 
 /** Kei per press of the faucet in the bar. */
 export const FAUCET_KEI = 25

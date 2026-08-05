@@ -16,7 +16,7 @@
  * showing something other than what it claims to show.
  */
 
-import type { TransferPolicy } from './listing.js'
+import type { TransferPolicy } from './listing'
 
 export interface Ask {
   units: number
