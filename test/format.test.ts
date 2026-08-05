@@ -14,7 +14,18 @@
 
 import { expect, test } from 'bun:test'
 
-import { formatAge, formatCoins, formatKei, formatPrice, KEI_RAW, parseKei, rawOfKei, shortAddress } from '../shared/format.js'
+import {
+  coinNote,
+  formatAge,
+  formatCoins,
+  formatKei,
+  formatPrice,
+  KEI_RAW,
+  parseCoins,
+  parseKei,
+  rawOfKei,
+  shortAddress,
+} from '../shared/format.js'
 
 // ----------------------------------------------------------------------- tests
 
@@ -112,4 +123,103 @@ test('a shortened address keeps both ends, because the prefix is shared', () => 
   expect(short.startsWith('kei_aa')).toBe(true)
   expect(short.endsWith('zzzzzz')).toBe(true)
   expect(short).toContain('…')
+})
+
+// ------------------------------------------------- parseCoins, the money one
+
+/**
+ * The Amount field, over the raw strings rather than over parsed numbers.
+ *
+ * `wholeCoins()` used to delete every non-digit and call it truncation, so the
+ * separator vanished and its digits were promoted into the integer: `2.5` was
+ * listed as 25 coins and a bid of `100.00` locked Kei for 10,000 (#16). Nothing
+ * downstream could have caught it — `lib/refusals.ts` only ever saw the number
+ * after it was already wrong, so every total on screen agreed with a quantity
+ * nobody had typed.
+ *
+ * These assert the strings, because the string is where the bug was.
+ */
+test('a fraction of a coin truncates to the whole part and never promotes its digits', () => {
+  // The bug, both directions. 25 and 10,000 are what the old parse answered.
+  expect(parseCoins('2.5')).toEqual({ count: 2, malformed: false, truncated: true })
+  expect(parseCoins('100.00')).toEqual({ count: 100, malformed: false, truncated: false })
+  expect(parseCoins('0.1')).toEqual({ count: 0, malformed: false, truncated: true })
+  expect(parseCoins('1.999')).toEqual({ count: 1, malformed: false, truncated: true })
+})
+
+test('trailing zeroes are not a fraction, so they are not reported as one', () => {
+  // `100.00` is a hundred exactly. Saying "that is 100" to somebody who typed a
+  // hundred would be noise, and noise is how a real notice gets ignored.
+  expect(parseCoins('100.00').truncated).toBe(false)
+  expect(parseCoins('7.0').truncated).toBe(false)
+  expect(parseCoins('7.01').truncated).toBe(true)
+})
+
+test('an integer with no point at all is unchanged', () => {
+  expect(parseCoins('1000')).toEqual({ count: 1000, malformed: false, truncated: false })
+  expect(parseCoins('0')).toEqual({ count: 0, malformed: false, truncated: false })
+  expect(parseCoins(' 42 ')).toEqual({ count: 42, malformed: false, truncated: false })
+})
+
+test('an empty field is not an error, because that is how the field starts', () => {
+  expect(parseCoins('')).toEqual({ count: 0, malformed: false, truncated: false })
+  expect(parseCoins('   ')).toEqual({ count: 0, malformed: false, truncated: false })
+})
+
+test('anything that is not a plain decimal is refused rather than guessed at', () => {
+  // `1,5` is the case that makes stripping separators unsafe: it is one and a
+  // half in most of Europe and fifteen if the comma is grouping. Refusing is
+  // the only answer that is not wrong for somebody.
+  for (const text of ['1,5', '1,234', '-5', '1e3', '0x10', 'Infinity', 'NaN', '1.2.3', '.5', '5.', 'ten', '1 000']) {
+    expect(parseCoins(text)).toEqual({ count: 0, malformed: true, truncated: false })
+  }
+})
+
+test('a quantity past the safe integer range is refused, not silently rounded', () => {
+  // 2^53 + 1 does not survive a `number`, and a lot that is off by one unit is
+  // off by one unit on somebody's own chain.
+  expect(parseCoins('9007199254740993').malformed).toBe(true)
+  expect(parseCoins('99999999999999999999').malformed).toBe(true)
+  expect(parseCoins('9007199254740991')).toEqual({
+    count: 9_007_199_254_740_991,
+    malformed: false,
+    truncated: false,
+  })
+})
+
+test('what the old parse answered, held down so it cannot come back', () => {
+  // Not a behaviour test — a bug test. Each of these was the wrong answer, and
+  // the two on the money path were wrong by two orders of magnitude.
+  expect(parseCoins('2.5').count).not.toBe(25)
+  expect(parseCoins('100.00').count).not.toBe(10_000)
+  expect(parseCoins('1,5').count).not.toBe(15)
+  expect(parseCoins('-5').count).not.toBe(5)
+})
+
+/**
+ * The sentence a fractional Amount puts on screen, before the button.
+ *
+ * Asserted here rather than in a render because `test/dom.ts` cannot deliver an
+ * event to a text input — React's change plugin throws on one — so no test in
+ * this repository can type into a field. That gap is most of why #16 reached
+ * `main`: the parse was wrong and the panel faithfully printed a total that
+ * agreed with it, and nothing checked either.
+ */
+test('a truncated amount says what will actually be listed, in coins', () => {
+  expect(coinNote(parseCoins('2.5'), 'CARPET')).toBe('CARPET has no decimal places, so that is 2 CARPET.')
+  // Grouped, because 1234 coins is unreadable at the width the note renders at.
+  expect(coinNote(parseCoins('1234.9'), 'KILIM')).toContain('1,234 KILIM')
+  // Half a coin is none of one, and saying so is the point: the trade is not the
+  // one that was typed.
+  expect(coinNote(parseCoins('0.4'), 'CARPET')).toContain('0 CARPET')
+})
+
+test('an amount that needed no truncating gets no note', () => {
+  // Silence is the signal. A note on every keystroke is a note nobody reads.
+  expect(coinNote(parseCoins('100'), 'CARPET')).toBeNull()
+  expect(coinNote(parseCoins('100.00'), 'CARPET')).toBeNull()
+  expect(coinNote(parseCoins(''), 'CARPET')).toBeNull()
+  // A refused amount is refused by name in `lib/refusals.ts`; there is no
+  // quantity here to make a note about.
+  expect(coinNote(parseCoins('1,5'), 'CARPET')).toBeNull()
 })

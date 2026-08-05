@@ -62,6 +62,75 @@ export function formatCoins(count: number): string {
   return Math.trunc(count).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')
 }
 
+/** What somebody typed into an Amount field, once it is read as a quantity. */
+export interface CoinAmount {
+  /** Whole coins. Zero unless the text is an amount this can read. */
+  count: number
+  /** The text is not a non-negative decimal number, so there is no quantity. */
+  malformed: boolean
+  /** It named a fraction of a coin. Coins have none, so it was dropped. */
+  truncated: boolean
+}
+
+/**
+ * A typed Amount as a whole number of coins.
+ *
+ * The previous version of this deleted every non-digit and called the result
+ * truncation, so `2.5` listed 25 coins and a bid of `100.00` locked Kei for
+ * 10,000 (#16): the separator was removed and its digits promoted into the
+ * integer. Nothing downstream could catch it, because by the time
+ * `lib/refusals.ts` saw the number it was already the wrong one, and every
+ * total on screen was arithmetically consistent with a quantity nobody typed.
+ *
+ * So this parses rather than coerces, and it accepts exactly what `parseKei`
+ * accepts: digits, optionally one point, nothing else. `Number()` is not a
+ * parser for this — it reads `1e3`, `0x10`, `Infinity`, leading signs and
+ * surrounding whitespace, and answers `NaN` for everything else, which is a
+ * value every caller then has to remember to check.
+ *
+ * Grouping separators are refused rather than stripped. Stripping them is how
+ * the original bug read `2.5`, and `1,5` is one-and-a-half to half the world
+ * and fifteen to the other half — a field that silently multiplies by ten
+ * depending on locale is worse than one that says it did not understand.
+ *
+ * Truncation is reported rather than applied silently for the same reason:
+ * SPEC §9.6 criterion 2 wants every state that changes a trade named on screen
+ * before the click, and quietly listing 2 coins for somebody who asked for 2.5
+ * is a changed trade.
+ */
+export function parseCoins(text: string): CoinAmount {
+  const trimmed = text.trim()
+  if (trimmed === '') return { count: 0, malformed: false, truncated: false }
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) return { count: 0, malformed: true, truncated: false }
+  const [whole = '0', fraction = ''] = trimmed.split('.')
+  const count = Number(whole)
+  // Past 2^53 a `number` cannot hold a quantity without losing units, and a lot
+  // that is off by one unit is off by one unit on somebody's own chain.
+  if (!Number.isSafeInteger(count)) return { count: 0, malformed: true, truncated: false }
+  return { count, malformed: false, truncated: /[1-9]/.test(fraction) }
+}
+
+/**
+ * What to say on screen when an Amount field names a fraction of a coin.
+ *
+ * A note rather than a refusal: 2.5 is a usable quantity, it is just two coins.
+ * But it has to be *said*, and said before the button, because the alternative
+ * is somebody finding out from the settled block that they listed a different
+ * number than they typed — which is the shape of #16 even once the arithmetic is
+ * right. SPEC §9.6 criterion 2 asks for every state that changes a trade to be
+ * named up front, and quietly listing 2 for somebody who asked for 2.5 is a
+ * changed trade.
+ *
+ * Here rather than in the panel so that the sentence is asserted rather than
+ * eyeballed. The DOM harness in `test/dom.ts` cannot deliver an event to a text
+ * input — React's change plugin throws on one — so nothing in this repository
+ * can type into a field, which is a large part of why #16 shipped.
+ */
+export function coinNote(amount: CoinAmount, symbol: string): string | null {
+  if (!amount.truncated) return null
+  return `${symbol} has no decimal places, so that is ${formatCoins(amount.count)} ${symbol}.`
+}
+
 /**
  * A price, at enough significant figures to tell two of them apart.
  *

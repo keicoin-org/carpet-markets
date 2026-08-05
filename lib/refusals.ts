@@ -35,6 +35,7 @@ export type BlockerCode =
   | 'over-held'
   | 'no-price'
   | 'no-amount'
+  | 'bad-amount'
   | 'busy'
 
 export interface Blocker {
@@ -50,6 +51,21 @@ const blocker = (code: BlockerCode, sentence: string, fix: string | null = null)
   sentence,
   fix,
 })
+
+/**
+ * The Amount field holds something that is not a quantity.
+ *
+ * Refusing rather than guessing is the whole point. The bug this replaces
+ * guessed — it deleted the separator out of `2.5` and listed 25 coins (#16) —
+ * and a field that silently reinterprets a number is one nobody can check
+ * before they sign.
+ */
+const badAmount = (listing: Listing): Blocker =>
+  blocker(
+    'bad-amount',
+    `That is not a number of ${listing.symbol}.`,
+    'Digits, and at most one decimal point. No commas, spaces or minus signs — a separator that means a thousand here means a half somewhere else, so this asks rather than assumes.',
+  )
 
 /**
  * Why this coin has no market at all, or null when it has one.
@@ -144,6 +160,8 @@ export interface SellContext {
   held: number
   /** Whole units being listed. */
   amount: number
+  /** The Amount field holds something that is not a quantity (#16). */
+  malformed?: boolean
   /** Asking price per unit, in Kei. */
   unitPrice: number
   /** Units this wallet has sitting in its own open offers for this coin. */
@@ -154,7 +172,7 @@ export interface SellContext {
 
 /** Why this listing cannot be written, or null when it can. */
 export function sellBlocker(context: SellContext): Blocker | null {
-  const { listing, funds, held, amount, unitPrice, locked, you, busy } = context
+  const { listing, funds, held, amount, malformed, unitPrice, locked, you, busy } = context
 
   const policy = policyBlocker(listing)
   if (policy) return policy
@@ -188,6 +206,7 @@ export function sellBlocker(context: SellContext): Blocker | null {
   if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
     return blocker('no-price', 'Set a price above zero.', 'The price is yours to choose — there is no curve quoting one for you.')
   }
+  if (malformed) return badAmount(listing)
   if (!Number.isFinite(amount) || amount <= 0) {
     return blocker('no-amount', 'Set a whole number of coins above zero.', null)
   }
@@ -266,6 +285,8 @@ export interface BidContext {
   funds: Funds
   /** Whole units wanted. */
   amount: number
+  /** The Amount field holds something that is not a quantity (#16). */
+  malformed?: boolean
   /** What to pay per unit, in Kei. */
   unitPrice: number
   /** Total in raw Kei, which is what actually gets locked. */
@@ -276,7 +297,7 @@ export interface BidContext {
 
 /** Why a bid cannot be written, or null when it can. The Kei is locked, so it has to be there. */
 export function bidBlocker(context: BidContext): Blocker | null {
-  const { listing, funds, amount, unitPrice, total, you, busy } = context
+  const { listing, funds, amount, malformed, unitPrice, total, you, busy } = context
 
   const policy = policyBlocker(listing)
   if (policy) return policy
@@ -290,6 +311,7 @@ export function bidBlocker(context: BidContext): Blocker | null {
   if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
     return blocker('no-price', 'Set a price above zero.', 'What you will pay is yours to choose — nothing is quoting it.')
   }
+  if (malformed) return badAmount(listing)
   if (!Number.isFinite(amount) || amount <= 0) {
     return blocker('no-amount', 'Set a whole number of coins above zero.', null)
   }
