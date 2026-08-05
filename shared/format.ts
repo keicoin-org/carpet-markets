@@ -122,9 +122,9 @@ export function parseCoins(text: string): CoinAmount {
  * changed trade.
  *
  * Here rather than in the panel so that the sentence is asserted rather than
- * eyeballed. The DOM harness in `test/dom.ts` cannot deliver an event to a text
- * input — React's change plugin throws on one — so nothing in this repository
- * can type into a field, which is a large part of why #16 shipped.
+ * eyeballed — though since #23 the harness in `test/dom.ts` can type into the
+ * field as well, and `test/screen.test.tsx` asserts this note is what a person
+ * reads after pressing `2`, `.`, `5`.
  */
 export function coinNote(amount: CoinAmount, symbol: string): string | null {
   if (!amount.truncated) return null
