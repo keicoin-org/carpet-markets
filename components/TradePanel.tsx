@@ -18,6 +18,10 @@
  * Every reason a button will not work is worked out before the click and shown
  * beside it (SPEC §9.6, criterion 2). `lib/refusals.ts` holds those, so the
  * sentence somebody reads is the same one a test asserts.
+ *
+ * The Buy half is `components/BuyFunnel.tsx` and moves through the five steps in
+ * `lib/funnel.ts`. Selling is one form and one signature, so it is still one
+ * form and one signature.
  */
 
 import { useEffect, useId, useMemo, useState } from 'react'
@@ -29,6 +33,7 @@ import { coinAmount, keiAmount, unitPrice, type Book, type Listing } from '../sh
 import { spendable, spendableCoins } from '../lib/balance'
 import { bidBlocker, sellBlocker, type Blocker } from '../lib/refusals'
 import { useMarket, useMyOffers } from '../lib/use-market'
+import { BuyFunnel } from './BuyFunnel'
 import { Ladder, spread } from './OrderBook'
 import { Tabs } from './Tabs'
 
@@ -97,10 +102,9 @@ export function TradePanel({
 
         <div className="p-3">
           {tab === 'buy' ? (
-            <>
-              <Ladder side="ask" listing={listing} offers={asks} held={held} loading={loading} onTraded={onTraded} />
+            <BuyFunnel listing={listing} asks={asks} held={held} loading={loading} onTraded={onTraded}>
               <BidForm listing={listing} startOpen={asks.length === 0} onTraded={onTraded} />
-            </>
+            </BuyFunnel>
           ) : (
             <>
               <SellForm listing={listing} held={held} onTraded={onTraded} />

@@ -39,10 +39,12 @@ export function KingOfTheHill({ listing }: { listing: Listing }) {
   const stats = listing.stats
 
   return (
-    <Link
-      href={{ pathname: '/coin', query: { asset: listing.asset } }}
-      className="group panel block overflow-hidden border-gold/35 bg-gradient-to-b from-gold/[0.07] to-transparent p-4 transition-colors hover:border-gold/60"
-    >
+    // The same shape as `components/CoinCard.tsx`, and for the same reason: the
+    // policy badge is a link, so wrapping the whole card in one would nest an
+    // anchor inside an anchor. The symbol carries the card's link and stretches
+    // an `::after` over the card to keep the whole tile clickable; the badge
+    // sits above that overlay on `z-10`.
+    <article className="group panel relative overflow-hidden border-gold/35 bg-gradient-to-b from-gold/[0.07] to-transparent p-4 transition-colors hover:border-gold/60 focus-within:border-gold/60">
       <div className="flex items-center gap-2">
         <span className="eyebrow text-gold/80">Most traded</span>
         <span className="h-px flex-1 bg-gradient-to-r from-gold/30 to-transparent" />
@@ -54,11 +56,19 @@ export function KingOfTheHill({ listing }: { listing: Listing }) {
 
         <div className="min-w-[12rem] flex-1">
           <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-1">
-            <h2 className="text-2xl font-bold tracking-tight group-hover:text-gold">{listing.symbol}</h2>
+            <h2 className="text-2xl font-bold tracking-tight group-hover:text-gold">
+              <Link
+                href={{ pathname: '/coin', query: { asset: listing.asset } }}
+                className="after:absolute after:inset-0 after:content-['']"
+              >
+                {listing.symbol}
+                <span className="sr-only"> — open this coin’s trade screen</span>
+              </Link>
+            </h2>
             <span className="text-sm text-dim">{listing.name}</span>
           </div>
           <div className="mt-2">
-            <PolicyBadge listing={listing} large />
+            <PolicyBadge listing={listing} large target="card" />
           </div>
           {listing.blurb && <p className="mt-2 max-w-prose text-sm leading-snug text-dim">{listing.blurb}</p>}
         </div>
@@ -79,6 +89,6 @@ export function KingOfTheHill({ listing }: { listing: Listing }) {
           </div>
         </div>
       </div>
-    </Link>
+    </article>
   )
 }

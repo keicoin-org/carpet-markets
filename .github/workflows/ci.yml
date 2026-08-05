@@ -38,6 +38,12 @@ jobs:
       - name: the client still exports to static files
         run: bun run build:site
 
+  # `bun run walk` is deliberately not a job here yet. It drives a real browser
+  # for the three SPEC §9.6 criteria happy-dom cannot reach, and on this branch
+  # two of the three do not hold (#18). A job that is red for a known reason
+  # teaches everyone to ignore it, so the walk stays a command somebody runs
+  # until the criteria it checks actually pass.
+
   # The claim that the public testnet can carry this market, checked against the
   # live node rather than against a fixture. It is a separate job because it
   # depends on a box the project runs best-effort, with no uptime promise

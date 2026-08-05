@@ -45,6 +45,7 @@ export function Ladder({
   held,
   loading,
   onTraded,
+  choose,
 }: {
   side: Side
   listing: Listing
@@ -52,6 +53,16 @@ export function Ladder({
   held: number
   loading: boolean
   onTraded: () => void
+  /**
+   * Hand the row to a funnel instead of signing it here.
+   *
+   * The buy path goes through `lib/funnel.ts`, where the terms are confirmed
+   * before a block is written. A row that signed on click would be a second way
+   * into a signature with no confirmation step, which is the thing the funnel
+   * exists to make unreachable. The bid side has no such step and passes
+   * nothing, so it keeps acting directly.
+   */
+  choose?: (offer: Offer) => void
 }) {
   const { trader, funds, busy, act } = useMarket()
   const you = trader?.address ?? null
@@ -159,7 +170,13 @@ export function Ladder({
                   aria-disabled={blocked !== null}
                   aria-label={`${side === 'ask' ? 'Buy' : 'Sell'} ${formatCoins(size)} ${listing.symbol} for ${formatPrice(
                     keiAmount(offer, listing.asset),
-                  )} Kei${blocked ? ` — unavailable: ${blocked.sentence}${blocked.fix ? ` ${blocked.fix}` : ''}` : ''}`}
+                  )} Kei${
+                    blocked
+                      ? ` — unavailable: ${blocked.sentence}${blocked.fix ? ` ${blocked.fix}` : ''}`
+                      : choose
+                        ? ' — the terms are shown for confirmation before anything is signed'
+                        : ''
+                  }`}
                   className={`rounded border px-2 py-1 text-xs font-medium transition-colors ${
                     blocked ? 'cursor-not-allowed opacity-40' : ''
                   } ${
@@ -167,8 +184,9 @@ export function Ladder({
                       ? 'border-up/60 bg-up/10 text-up hover:bg-up/20'
                       : 'border-down/60 bg-down/10 text-down hover:bg-down/20'
                   }`}
-                  onClick={() =>
-                    blocked ||
+                  onClick={() => {
+                    if (blocked) return
+                    if (choose) return choose(offer)
                     void act(
                       side === 'ask' ? 'buy' : 'sell',
                       side === 'ask'
@@ -186,7 +204,7 @@ export function Ladder({
                         ? { kei: -rawOfKei(keiAmount(offer, listing.asset)), coins: [[listing.asset, size]] }
                         : { kei: rawOfKei(keiAmount(offer, listing.asset)), coins: [[listing.asset, -size]] },
                     )
-                  }
+                  }}
                 >
                   {side === 'ask' ? 'Buy' : 'Sell'}
                 </button>
