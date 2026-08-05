@@ -156,45 +156,78 @@ export function MarketProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  /**
+   * One poll, with each read standing or falling on its own.
+   *
+   * It used to be one `try` around one `Promise.all`, which made a poll
+   * all-or-nothing: whichever read failed first threw away every read in the
+   * same round, including the ones that had already come back. On a page where
+   * one of those reads is this wallet's own open orders, that is not a stale
+   * figure — it is a seller whose units are locked by a `swap_offer` block and
+   * whose only route to the cancel that frees them (SPEC §9.2) is a panel that
+   * has just been emptied by an unrelated read of somebody else's holders.
+   * The panel a seller needs most disappeared when the least was wrong.
+   *
+   * So each read now updates its own state or leaves the last good value alone,
+   * and the feed says which one did not come back. That is also why `activity`
+   * loses its `.catch(() => [])`: replacing a failed read with an empty list
+   * prints "nothing has settled" for "we could not ask", which is the shape of
+   * bug `lib/metrics.ts` exists to prevent.
+   */
   const refresh = useCallback(async () => {
     const active = traderRef.current
     if (!active) return
-    try {
-      const next = await active.facts()
+
+    const missed: string[] = []
+    const read = async <T,>(what: string, from: Promise<T>, into: (value: T) => void): Promise<void> => {
+      try {
+        into(await from)
+      } catch (error) {
+        missed.push(`${what} (${explain(error)})`)
+      }
+    }
+
+    // The asset list has to come back before holdings can be asked for. If it
+    // does not, holdings is not asked at all — asking for none of them would
+    // answer "you hold nothing", which is a different sentence from "we could
+    // not read the board".
+    let listed: string[] | null = null
+    await read('the board', active.facts(), (next) => {
       setFacts(next)
+      listed = next.listings.map((listing) => listing.asset)
+    })
 
-      // Before reading balances, not after. Coins bought through a settlement
-      // are a receivable until this wallet signs for them (SPEC §5.6.3), and
-      // reading first shows a holder nothing, correctly, about the wrong moment.
-      await active.sync()
+    // Before reading balances, not after. Coins bought through a settlement
+    // are a receivable until this wallet signs for them (SPEC §5.6.3), and
+    // reading first shows a holder nothing, correctly, about the wrong moment.
+    await read('this wallet', active.sync(), () => {})
 
-      // And `incoming` after the sync, not before: anything read before it has
-      // just been claimed by it, and would be counted once as confirmed and
-      // again as on its way. What is left here is genuinely still owed.
-      const [confirmed, waiting, held, open, settled] = await Promise.all([
-        active.keiBalance(),
-        active.incoming(),
-        active.holdings(next.listings.map((listing) => listing.asset)),
-        active.mine(),
-        active.activity().catch(() => [] as Trade[]),
-      ])
-      setChain({ confirmed, incoming: waiting.kei, arrivals: waiting.arrivals })
-      setHoldings(held)
-      setMine(open)
-      setActivity(settled)
-      setFeed((current) => fed(current, Date.now()))
-    } catch (error) {
-      // A missed poll is not something to shout about — the next one is two
-      // seconds away and the page is still showing the last good read. What it
-      // must not be is silent: the bar carries the age of what is on screen, so
-      // a feed that has stopped is visible rather than inferred from figures
-      // that have simply stopped moving.
-      const why = explain(error)
+    await Promise.all([
+      read('your Kei', active.keiBalance(), (confirmed) => setChain((now) => ({ ...now, confirmed }))),
+      // `incoming` after the sync, not before: anything read before it has just
+      // been claimed by it, and would be counted once as confirmed and again as
+      // on its way. What is left here is genuinely still owed.
+      read('what is on its way', active.incoming(), (waiting) =>
+        setChain((now) => ({ ...now, incoming: waiting.kei, arrivals: waiting.arrivals })),
+      ),
+      ...(listed === null ? [] : [read('what you hold', active.holdings(listed), setHoldings)]),
+      read('your open orders', active.mine(), setMine),
+      read('what has settled', active.activity(), setActivity),
+    ])
+
+    // A missed read is not something to shout about — the next poll is two
+    // seconds away and the page is still showing the last good one. What it
+    // must not be is silent: the bar carries the age of what is on screen, so a
+    // feed that has stopped is visible rather than inferred from figures that
+    // have simply stopped moving.
+    if (missed.length > 0) {
+      const why = `could not read ${missed.join(', ')}`
       console.warn('carpet: a read did not come back —', why)
       setFeed((current) => starved(current, why))
-    } finally {
-      setLoading(false)
+    } else {
+      setFeed((current) => fed(current, Date.now()))
     }
+    setLoading(false)
   }, [])
 
   useEffect(() => {
