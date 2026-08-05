@@ -24,7 +24,7 @@ import { useEffect, useId, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { Offer } from 'kei-transaction'
 
-import { formatCoins, formatKei, formatPrice, rawOfKei } from '../shared/format'
+import { coinNote, formatCoins, formatKei, formatPrice, parseCoins, rawOfKei } from '../shared/format'
 import { coinAmount, keiAmount, unitPrice, type Book, type Listing } from '../shared/listing'
 import { spendable, spendableCoins } from '../lib/balance'
 import { bidBlocker, sellBlocker, type Blocker } from '../lib/refusals'
@@ -136,7 +136,9 @@ function SellForm({ listing, held, onTraded }: { listing: Listing; held: number;
   const noteId = useId()
 
   const available = spendableCoins(funds, listing.asset, held)
-  const count = wholeCoins(amount)
+  const typed = parseCoins(amount)
+  const count = typed.count
+  const note = coinNote(typed, listing.symbol)
   const unit = Number(each)
 
   const blocked = sellBlocker({
@@ -144,6 +146,7 @@ function SellForm({ listing, held, onTraded }: { listing: Listing; held: number;
     funds,
     held,
     amount: count,
+    malformed: typed.malformed,
     unitPrice: unit,
     locked,
     you: trader?.address ?? null,
@@ -161,7 +164,7 @@ function SellForm({ listing, held, onTraded }: { listing: Listing; held: number;
             inputMode="numeric"
             value={amount}
             aria-describedby={noteId}
-            aria-invalid={blocked?.code === 'no-amount' || blocked?.code === 'over-held'}
+            aria-invalid={blocked?.code === 'no-amount' || blocked?.code === 'bad-amount' || blocked?.code === 'over-held'}
             onChange={(event) => setAmount(event.target.value)}
             className="mt-1 w-full field px-2.5 py-2 font-mono text-sm"
           />
@@ -185,6 +188,7 @@ function SellForm({ listing, held, onTraded }: { listing: Listing; held: number;
 
       <Note id={noteId} blocked={blocked}>
         <span className="text-fainter">
+          {note && <span className="text-ink">{note} </span>}
           Asking <span className="text-ink">{formatPrice(count * unit)} Kei</span> for the lot. You can move{' '}
           {formatCoins(available)}
           {available !== held && ` of ${formatCoins(held)}, the rest locked in your own orders`}.
@@ -255,7 +259,9 @@ function BidForm({
   const priceId = useId()
   const noteId = useId()
 
-  const count = wholeCoins(amount)
+  const typed = parseCoins(amount)
+  const count = typed.count
+  const note = coinNote(typed, listing.symbol)
   const unit = Number(each)
   const total = useMemo(() => rawOfKei(count * unit), [count, unit])
 
@@ -263,6 +269,7 @@ function BidForm({
     listing,
     funds,
     amount: count,
+    malformed: typed.malformed,
     unitPrice: unit,
     total,
     you: trader?.address ?? null,
@@ -289,7 +296,7 @@ function BidForm({
               inputMode="numeric"
               value={amount}
               aria-describedby={noteId}
-              aria-invalid={blocked?.code === 'no-amount'}
+              aria-invalid={blocked?.code === 'no-amount' || blocked?.code === 'bad-amount'}
               onChange={(event) => setAmount(event.target.value)}
               className="mt-1 w-full field px-2.5 py-2 font-mono text-sm"
             />
@@ -311,6 +318,7 @@ function BidForm({
 
         <Note id={noteId} blocked={blocked}>
           <span className="text-fainter">
+            {note && <span className="text-ink">{note} </span>}
             Locking <span className="text-ink">{formatKei(total, 4)} Kei</span> until somebody fills it or you cancel.{' '}
             {formatKei(spendable(funds), 4)} is spendable.
           </span>
@@ -389,11 +397,6 @@ function Note({ id, blocked, children }: { id: string; blocked: Blocker | null; 
       )}
     </p>
   )
-}
-
-/** Whatever was typed, as a whole number of coins. Coins have no decimals. */
-function wholeCoins(text: string): number {
-  return Math.trunc(Number(text.replace(/[^\d]/g, '') || '0'))
 }
 
 function NoMarket({ listing }: { listing: Listing }) {

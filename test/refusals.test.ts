@@ -306,3 +306,55 @@ test('every refusal is a sentence, not a code', () => {
     expect(blocked!.sentence.length).toBeGreaterThan(20)
   }
 })
+
+/**
+ * A field holding something that is not a quantity is a refusal, not a zero.
+ *
+ * Before #16 there was no such state: the parse deleted whatever it did not
+ * recognise and handed the blockers a number that had already been changed, so
+ * `1,5` reached the ledger as fifteen coins with nothing on screen dissenting.
+ */
+test('an unreadable amount is refused by name, on both sides of the book', () => {
+  const sell = sellBlocker({
+    listing: listing(),
+    funds: funds(),
+    held: 5_000,
+    amount: 0,
+    malformed: true,
+    unitPrice: 1,
+    locked: 0,
+    you: YOU,
+    busy: false,
+  })
+  expect(sell?.code).toBe('bad-amount')
+  expect(sell?.sentence).toMatch(/not a number of CARPET/i)
+  // The fix has to say what is allowed, or it is a dead end.
+  expect(sell?.fix).toMatch(/decimal point/i)
+
+  const bid = bidBlocker({
+    listing: listing(),
+    funds: funds(),
+    amount: 0,
+    malformed: true,
+    unitPrice: 1,
+    total: 0n,
+    you: YOU,
+    busy: false,
+  })
+  expect(bid?.code).toBe('bad-amount')
+})
+
+test('a readable amount is not refused as unreadable', () => {
+  const sell = sellBlocker({
+    listing: listing(),
+    funds: funds(),
+    held: 5_000,
+    amount: 2,
+    malformed: false,
+    unitPrice: 1,
+    locked: 0,
+    you: YOU,
+    busy: false,
+  })
+  expect(sell).toBeNull()
+})
