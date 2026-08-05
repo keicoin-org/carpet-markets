@@ -146,7 +146,17 @@ test('an untraded coin renders "never traded" and no zero, for every metric', ()
 test('volume is on the screen, which is the half of criterion 4 that was missing', () => {
   const priced: Book = {
     ...EMPTY_BOOK,
-    price: { asset: ASSET, quote: 'kei', median: 5e-4, last: 6e-4, low: 4e-4, high: 8e-4, trades: 3, volume: 4_500 },
+    price: {
+      asset: ASSET,
+      quote: 'kei',
+      median: 5e-4,
+      last: 6e-4,
+      low: 4e-4,
+      high: 8e-4,
+      trades: 3,
+      volume: 4_500,
+      coverage: null,
+    },
   }
   const view = render(<Readout metric={metric('volume')} context={{ ...READINGS, book: priced }} />)
   expect(view.text()).toBe('Volume4,500 CARPET')

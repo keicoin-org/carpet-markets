@@ -76,6 +76,7 @@ const PRICED: PriceSummary = {
   high: 0.0008,
   trades: 3,
   volume: 4_500,
+  coverage: null,
 }
 
 // ------------------------------------------------------- the criterion itself
