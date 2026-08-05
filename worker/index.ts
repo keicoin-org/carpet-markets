@@ -22,11 +22,13 @@ import {
   NEXT_SEQUENCE,
   ReplayLimitError,
   canonicalEvents,
+  countingStorage,
   eventBytes,
   eventKey,
   loadLog,
   logSize,
   measureRawUsage,
+  noStorageWork,
   processBlockIdentity,
   processInputIdentity,
   rawLimitError,
@@ -37,7 +39,9 @@ import {
   type CheckpointManifest,
   type EventInput,
   type LoadedLog,
+  type LogStorage,
   type LogUsage,
+  type StorageWork,
   type StoredEvent,
 } from './durable-log.js'
 
@@ -87,6 +91,8 @@ export class Floor extends DurableObject<Env> {
   #acceptanceBlocked: ReplayLimitError | undefined
   /** Persisted `event:v1:*` rows and bytes, measured from storage. */
   #rawUsage: LogUsage = { events: 0, bytes: 0 }
+  /** Storage work done by the mutation currently being written. */
+  #work: StorageWork = noStorageWork()
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)

@@ -115,6 +115,68 @@ export interface LogStorage extends LogTransaction {
   transaction<T>(closure: (transaction: LogTransaction) => Promise<T>): Promise<T>
 }
 
+/** Storage work, counted as it happens rather than asserted from the code. */
+export interface StorageWork {
+  /** Calls that reach the Durable Object storage API. */
+  operations: number
+  /** Individual keys written or deleted by them. */
+  keyWrites: number
+}
+
+export function noStorageWork(): StorageWork {
+  return { operations: 0, keyWrites: 0 }
+}
+
+/**
+ * `storage`, with every call it receives added to `work`.
+ *
+ * Issue #8 asks for storage reads/writes and rows per accepted mutation. The
+ * first version of this metric reported the constant 3 for both — a number
+ * somebody arrived at by reading `#append` and `#accept` once. It was already
+ * wrong for operations (there are four, and five in compact mode, where
+ * admission lists the persisted prefix before it allocates anything), and being
+ * a literal it would have stayed both wrong and plausible through any later
+ * change to either method.
+ *
+ * So it is counted where it happens. A `put` of a record is one operation and
+ * one key write per key, because that is what it costs; a transaction counts
+ * its own call plus whatever the closure does inside it.
+ */
+export function countingStorage(storage: LogStorage, work: StorageWork): LogStorage {
+  const countPut = (keyOrEntries: unknown): void => {
+    work.operations += 1
+    work.keyWrites += typeof keyOrEntries === 'string' ? 1 : Object.keys(keyOrEntries as object).length
+  }
+  const put = (target: LogTransaction): LogTransaction['put'] =>
+    (async (keyOrEntries: unknown, value?: unknown) => {
+      countPut(keyOrEntries)
+      return typeof keyOrEntries === 'string'
+        ? target.put(keyOrEntries, value)
+        : target.put(keyOrEntries as Record<string, unknown>)
+    }) as LogTransaction['put']
+
+  return {
+    put: put(storage),
+    get: (async (keys: string | string[]) => {
+      work.operations += 1
+      return storage.get(keys as string)
+    }) as LogStorage['get'],
+    list: async (options) => {
+      work.operations += 1
+      return storage.list(options)
+    },
+    delete: async (keys) => {
+      work.operations += 1
+      work.keyWrites += keys.length
+      return storage.delete(keys)
+    },
+    transaction: async (closure) => {
+      work.operations += 1
+      return storage.transaction(async (inner) => closure({ put: put(inner) }))
+    },
+  }
+}
+
 export class ReplayLimitError extends Error {
   constructor(message: string, readonly status = 507) {
     super(message)
