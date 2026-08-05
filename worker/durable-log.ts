@@ -105,6 +105,14 @@ export interface LoadedLog {
 interface LogTransaction {
   put<T>(key: string, value: T): Promise<void>
   put<T>(entries: Record<string, T>): Promise<void>
+  /**
+   * A transaction reads as well as writes — `#append` allocates its sequence
+   * from inside one. Naming it here is what lets a counted storage stand in for
+   * the real one: a wrapper can only forward the calls the type admits the
+   * closure may make, and a closure whose read went uncounted is the same silent
+   * under-report this counting exists to remove.
+   */
+  get<T = unknown>(key: string): Promise<T | undefined>
 }
 
 export interface LogStorage extends LogTransaction {
@@ -141,6 +149,11 @@ export function noStorageWork(): StorageWork {
  * So it is counted where it happens. A `put` of a record is one operation and
  * one key write per key, because that is what it costs; a transaction counts
  * its own call plus whatever the closure does inside it.
+ *
+ * The counter is deliberately not reset here. A mutation resets it once, before
+ * it starts writing, and every call the write path makes after that lands in the
+ * same total — which is what makes the reported figure "per accepted mutation"
+ * rather than per method.
  */
 export function countingStorage(storage: LogStorage, work: StorageWork): LogStorage {
   const countPut = (keyOrEntries: unknown): void => {
@@ -154,13 +167,18 @@ export function countingStorage(storage: LogStorage, work: StorageWork): LogStor
         ? target.put(keyOrEntries, value)
         : target.put(keyOrEntries as Record<string, unknown>)
     }) as LogTransaction['put']
+  // Typed on the narrow single-key `get` a transaction offers, because that is
+  // the shape both callers satisfy: storage's overloaded `get` is assignable to
+  // it, and the cast on the way out restores the array form storage really has.
+  const get = (target: Pick<LogTransaction, 'get'>): LogStorage['get'] =>
+    (async (keys: string | string[]) => {
+      work.operations += 1
+      return target.get(keys as string)
+    }) as LogStorage['get']
 
   return {
     put: put(storage),
-    get: (async (keys: string | string[]) => {
-      work.operations += 1
-      return storage.get(keys as string)
-    }) as LogStorage['get'],
+    get: get(storage),
     list: async (options) => {
       work.operations += 1
       return storage.list(options)
@@ -172,7 +190,7 @@ export function countingStorage(storage: LogStorage, work: StorageWork): LogStor
     },
     transaction: async (closure) => {
       work.operations += 1
-      return storage.transaction(async (inner) => closure({ put: put(inner) }))
+      return storage.transaction(async (inner) => closure({ put: put(inner), get: get(inner) }))
     },
   }
 }
