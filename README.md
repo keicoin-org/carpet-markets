@@ -27,12 +27,13 @@ Durable Object. That deployed object starts with the same deterministic six-coin
 board and replays its storage-backed event log after eviction, so an accepted buy
 is still there after a cold start.
 
-The seeded board leaves exactly two open asks: FRINGE at 10 Kei and KILIM at 66,
-against a faucet that hands out 25. One visitor can buy FRINGE; everybody after
-them faces the 66 Kei lot and has to press the faucet three times, because the
-deployed board is one shared object seeded once. That is
-[issue #18](https://github.com/keicoin-org/carpet-markets/issues/18) and it is a
-bug in the seed economics, not in the wallet.
+Every coin the board calls buyable has a lot one faucet press covers. That is not
+a coincidence in the seed data: the board is `shared/demo-board.ts`, the grant is
+`shared/faucet.ts`, and `test/first-buy.test.ts` opens a fresh wallet against each
+of those coins and settles its cheapest ask, so an edit that prices the small side
+out of reach fails in `bun test` rather than in front of a visitor. It used to
+leave KILIM's 66 Kei lot as the cheapest thing open against a 25 Kei grant, which
+was [#18](https://github.com/keicoin-org/carpet-markets/issues/18).
 
 > **This is a demo, and every coin on it is worthless by construction.** That is
 > what makes it safe to show you how a market like this actually behaves.
@@ -135,11 +136,11 @@ four — narrow to what is buyable, open a coin, take a row, confirm — against
 SPEC §9.6 criterion 1's budget of five.
 
 That is the click count, and it is not the same claim as a stranger getting
-through. `bun run walk` counts the interactions in a real browser, and it does
-not currently reach a settled buy: the faucet hands a new wallet 25 Kei and the
-cheapest lot on the first buyable coin costs 66. The funnel says so in the row's
-own words instead of failing at the signature, but an affordable first lot is a
-board problem rather than a funnel one, and it is open as #18.
+through. The money half of that is `test/first-buy.test.ts`, which presses the
+faucet once and settles a real lot on every coin the board calls buyable, and the
+shortfall the funnel reports on any other row now names the number of presses that
+covers it. `bun run walk` counts the interactions in a real browser and is the
+only thing that checks both halves at once.
 
 ### There is no curve, deliberately
 

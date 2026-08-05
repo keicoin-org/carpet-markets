@@ -36,6 +36,7 @@ import { Kei, randomSeed } from 'kei-transaction'
 import puppeteer, { type Browser, type Page } from 'puppeteer-core'
 
 import { resolveSpawn } from '../spawn.js'
+import { FAUCET_KEI } from '../shared/faucet.js'
 import type { LaunchQuote, MarketFacts } from '../shared/listing.js'
 
 const root = Bun.fileURLToPath(new URL('..', import.meta.url))
@@ -52,9 +53,6 @@ const HEADED = argv.includes('--headed')
 
 const API = `http://127.0.0.1:${API_PORT}`
 const SITE = `http://127.0.0.1:${CLIENT_PORT}`
-
-/** A visitor arrives with what the demo's own faucet hands a new wallet. */
-const FAUCET_KEI = 25
 
 /** SPEC §9.6, criterion 1. Five, not "about five". */
 const BUDGET = 5
