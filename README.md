@@ -24,8 +24,15 @@ with no Node server behind it. `next dev` proxies `/rpc` and `/market/*` to the
 Bun process on :7788; the deployed copy has no proxy at all, because there a
 Cloudflare Worker serves the exported files and answers those two paths out of a
 Durable Object. That deployed object starts with the same deterministic six-coin
-board and replays its storage-backed event log after eviction, so a first visit
-has something buyable and an accepted buy is still there after a cold start.
+board and replays its storage-backed event log after eviction, so an accepted buy
+is still there after a cold start.
+
+The seeded board leaves exactly two open asks: FRINGE at 10 Kei and KILIM at 66,
+against a faucet that hands out 25. One visitor can buy FRINGE; everybody after
+them faces the 66 Kei lot and has to press the faucet three times, because the
+deployed board is one shared object seeded once. That is
+[issue #18](https://github.com/keicoin-org/carpet-markets/issues/18) and it is a
+bug in the seed economics, not in the wallet.
 
 > **This is a demo, and every coin on it is worthless by construction.** That is
 > what makes it safe to show you how a market like this actually behaves.
@@ -134,7 +141,9 @@ bug.
 
 Every coin now gets its own issuing account, derived from the registry's seed by
 index. A launch pays that account's first burn — **1 Kei, forever** — and never
-anybody else's. Spam is still bounded, per launcher, exactly as the spec intended.
+anybody else's. The launcher is charged **1.1 Kei**: the 1 Kei burn, plus a 0.1 Kei
+margin so the new issuing account can still sign after paying it. Spam is still
+bounded, per launcher, exactly as the spec intended.
 
 ## Where things are
 
