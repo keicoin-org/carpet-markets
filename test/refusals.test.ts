@@ -13,6 +13,7 @@ import { expect, test } from 'bun:test'
 
 import { NO_FUNDS, type Funds, type InFlight } from '../lib/balance.js'
 import { bidBlocker, buyBlocker, fillBidBlocker, launchBlocker, sellBlocker } from '../lib/refusals.js'
+import { FAUCET_KEI } from '../shared/faucet.js'
 import { KEI_RAW } from '../shared/format.js'
 import type { Listing, TransferPolicy } from '../shared/listing.js'
 
@@ -109,6 +110,38 @@ test('a genuinely empty wallet is told it is short and where to get more', () =>
   expect(blocked?.code).toBe('short')
   expect(blocked?.sentence).toMatch(/0\.1 is spendable/)
   expect(blocked?.fix).toMatch(/faucet/i)
+})
+
+/**
+ * The shortfall the demo board used to walk a stranger into (#18).
+ *
+ * A first-time wallet holds one faucet grant, and the fix for a lot that costs
+ * more than that is to press the faucet again — which is only a fix if the page
+ * says so and says how many times. "The faucet hands out 25 Kei" next to a 66 Kei
+ * lot leaves the arithmetic to somebody who has been on the site for ten seconds.
+ */
+test('a shortfall says how many faucet presses cover it', () => {
+  const short = (total: bigint) =>
+    buyBlocker({
+      listing: listing(),
+      funds: NO_FUNDS,
+      total,
+      from: THEM,
+      you: YOU,
+      busy: false,
+    })
+
+  const grant = BigInt(FAUCET_KEI) * KEI_RAW
+
+  // Inside one grant, and exactly one grant, are both a single press.
+  expect(short(grant / 2n)?.fix).toMatch(/press it once/)
+  expect(short(grant)?.fix).toMatch(/press it once/)
+
+  // A hair over one grant is two, because the faucet does not pay fractions.
+  expect(short(grant + 1n)?.fix).toMatch(/press it 2 times/)
+
+  // The lot from the issue: 66 Kei against a 25 Kei grant.
+  expect(short(66n * KEI_RAW)?.fix).toMatch(/press it 3 times/)
 })
 
 test('coins locked in your own offers are named as locked, with the cancel as the fix', () => {

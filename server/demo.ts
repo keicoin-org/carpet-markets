@@ -5,88 +5,10 @@ import { Kei } from 'kei-transaction'
 
 import type { Registry } from './registry.js'
 import { Threads } from './social.js'
-import type { TransferPolicy } from '../shared/listing.js'
+import { DEMO_BOARD } from '../shared/demo-board.js'
 import { cleanReply, replyHash } from '../shared/social.js'
 
 export const DEMO_REGISTRY_SEED = 'A1'.repeat(32)
-
-interface DemoPlan {
-  symbol: string
-  name: string
-  blurb: string
-  transfer: TransferPolicy
-  asks: { units: number; each: number }[]
-  filled: number
-  bids: { units: number; each: number }[]
-  replies: string[]
-}
-
-const DEMO_PLANS: DemoPlan[] = [
-  {
-    symbol: 'KILIM',
-    name: 'Kilim',
-    blurb: 'Flat-woven, reversible, and so is the position.',
-    transfer: 'open',
-    asks: [
-      { units: 40_000, each: 0.0004 },
-      { units: 25_000, each: 0.0006 },
-      { units: 60_000, each: 0.0011 },
-    ],
-    filled: 2,
-    bids: [{ units: 20_000, each: 0.0003 }],
-    replies: ['weaving, not selling', 'the creator has moved 65k units. it is on the chart.'],
-  },
-  {
-    symbol: 'UNDERLAY',
-    name: 'Underlay',
-    blurb: 'Nobody thinks about it until they are standing on nothing.',
-    transfer: 'open',
-    asks: [{ units: 300_000, each: 0.00008 }],
-    filled: 1,
-    bids: [{ units: 50_000, each: 0.00005 }],
-    replies: ['300k in one clip. that is a third of the supply.'],
-  },
-  {
-    symbol: 'FRINGE',
-    name: 'Fringe',
-    blurb: 'The part that frays first.',
-    transfer: 'open',
-    asks: [{ units: 5_000, each: 0.002 }],
-    filled: 0,
-    bids: [],
-    replies: [],
-  },
-  {
-    symbol: 'WARP',
-    name: 'Warp',
-    blurb: 'Traded once, and nobody is offering since.',
-    transfer: 'open',
-    asks: [{ units: 10_000, each: 0.00035 }],
-    filled: 1,
-    bids: [],
-    replies: [],
-  },
-  {
-    symbol: 'HEIRLOOM',
-    name: 'Heirloom',
-    blurb: 'Soulbound. It cannot be sold, by anybody, including whoever made it.',
-    transfer: 'none',
-    asks: [],
-    filled: 0,
-    bids: [],
-    replies: ['this one genuinely cannot be dumped on you. the ledger says so.'],
-  },
-  {
-    symbol: 'BAZAAR',
-    name: 'Bazaar Credit',
-    blurb: 'Issuer-only. Whatever market it has, the issuer is the whole of it.',
-    transfer: 'issuer-only',
-    asks: [],
-    filled: 0,
-    bids: [],
-    replies: [],
-  },
-]
 
 const BUYER_SEED = 'B2'.repeat(32)
 const CREATOR_SEEDS = ['C3', 'D4', 'E5', 'F6', '07', '18'].map((pair) => pair.repeat(32))
@@ -107,7 +29,7 @@ export async function seedDemo(options: {
   options.registry.watch(buyer.address)
 
   try {
-    for (const [index, plan] of DEMO_PLANS.entries()) {
+    for (const [index, plan] of DEMO_BOARD.entries()) {
       const seed = CREATOR_SEEDS[index]!
       const creator = await Kei.server({ seed, node: options.node, network: 'mock' })
       try {
