@@ -26,8 +26,8 @@
     "test:workers": "vitest run --config vitest.worker.config.ts && vitest run --config vitest.mainnet.config.ts"
   },
   "dependencies": {
-    "@keicoin/core": "^0.3.0",
-    "kei-transaction": "^0.3.0",
+    "@keicoin/core": "^0.5.0",
+    "kei-transaction": "^0.8.0",
     "next": "^16.2.12",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"

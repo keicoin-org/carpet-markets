@@ -43,6 +43,8 @@ export type RecoveryKind =
   | 'fund'
   /** Somebody else consumed the offer first. Read the book again and pick another. */
   | 'gone'
+  /** The chain's terms were not the terms on screen, so nothing was signed. */
+  | 'changed'
   /** The ledger will never allow this. There is no version of trying harder. */
   | 'refused'
   /** The money already left. Repeating it would spend again, so nothing offers to. */
@@ -94,6 +96,14 @@ const RECOVERIES: Record<RecoveryKind, (message: string) => Recovery> = {
     hint: 'Somebody else took that offer first. Nothing left your wallet — the book below has already refreshed.',
     retryable: false,
   }),
+  // Never retryable, and that is the whole point. A retry would sign for the
+  // chain's numbers rather than the ones that were read, which is the trade
+  // this refusal exists to stop.
+  changed: () => ({
+    kind: 'changed',
+    hint: 'The offer on the chain is not the one this page drew, so nothing was signed. The book below has already refreshed — read the row again before taking it.',
+    retryable: false,
+  }),
   refused: () => ({
     kind: 'refused',
     hint: 'The chain refuses this, permanently, because of the policy the coin was issued under. This is the ledger working rather than the page failing.',
@@ -112,7 +122,7 @@ const RECOVERIES: Record<RecoveryKind, (message: string) => Recovery> = {
 }
 
 /**
- * Which of the six failures this is, from the sentence the SDK produced.
+ * Which of the seven failures this is, from the sentence the SDK produced.
  *
  * Matching on message text is not lovely and it is the honest option: `KeiError`
  * codes cover the SDK's own refusals and the interesting ones here come back
@@ -124,6 +134,12 @@ const RECOVERIES: Record<RecoveryKind, (message: string) => Recovery> = {
 export function classify(message: string): Recovery {
   const text = message.toLowerCase()
 
+  // First, because the rest of this sentence quotes both sides of every field
+  // that moved — an address, an asset id, two amounts — and any of those can
+  // carry a word one of the rules below matches on.
+  if (/not the trade that was shown/.test(text)) {
+    return RECOVERIES.changed(message)
+  }
   if (/transfer policy|cannot be transferred|soulbound|issuer-only|not permitted/.test(text)) {
     return RECOVERIES.refused(message)
   }

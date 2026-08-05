@@ -19,7 +19,7 @@
  * take to clear everything down to that price.
  */
 
-import type { Offer } from 'kei-transaction'
+import { expectationFrom, type Offer } from 'kei-transaction'
 
 import { formatCoins, formatPrice, rawOfKei, shortAddress } from '../shared/format'
 import { coinAmount, keiAmount, unitPrice, type Listing } from '../shared/listing'
@@ -175,7 +175,11 @@ export function Ladder({
                         ? `Buying ${formatCoins(size)} ${listing.symbol}`
                         : `Selling ${formatCoins(size)} ${listing.symbol}`,
                       async () => {
-                        await trader?.accept(offer.hash)
+                        // Built from `offer` itself, which is the object the two
+                        // columns above were drawn from — so the terms checked
+                        // against the chain are the terms on screen and not a
+                        // second copy that could have been rounded on the way.
+                        await trader?.accept(offer.hash, expectationFrom(offer))
                         onTraded()
                       },
                       side === 'ask'
