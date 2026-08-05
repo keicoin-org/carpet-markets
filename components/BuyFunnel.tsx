@@ -73,10 +73,20 @@ export function BuyFunnel({
   // The book polls every two seconds. `quoted` only ever moves between the first
   // two steps, so an ask filled by somebody else cannot rewind a confirmation, a
   // block in flight, or a settled trade under the person reading it.
+  //
+  // `funnel.step` is a dependency because the book is not the only thing that
+  // sends this panel back to the first step: `reopened` does, and it changes
+  // neither `asks.length` nor `loading` — `loading` latches false after the
+  // first read in `useCoin`. Without it, "Back to the book" after a buy sat on
+  // `empty` announcing that nobody was selling, over rows it was rendering, and
+  // came right only if a third party happened to trade. The anti-rewind property
+  // is `quoted`'s own guard rather than this list: for `intent`, `pending` and
+  // `settled` it returns the funnel it was given, so re-deriving on every step
+  // change is a no-op there and the extra pass cannot loop.
   useEffect(() => {
     if (loading && asks.length === 0) return
     setFunnel((current) => quoted(current, asks.length))
-  }, [asks.length, loading])
+  }, [asks.length, loading, funnel.step])
 
   // The confirmation replaces the book inside the panel, so a keyboard visitor
   // who pressed Enter on a row would otherwise be left focused on nothing.

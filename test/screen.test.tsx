@@ -14,7 +14,7 @@
  */
 
 import { expect, mock, test } from 'bun:test'
-import { act } from 'react'
+import { act, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { Expectation, Offer } from 'kei-transaction'
 
@@ -51,6 +51,7 @@ const { MarketStateProvider } = await import('../lib/use-market.js')
 
 import type { MetricContext } from '../lib/metrics'
 import type { Book, Listing } from '../shared/listing'
+import type { Rendered } from './dom'
 
 const ASSET = 'asset-CARPET'
 const YOU = 'kei_you'
@@ -432,6 +433,54 @@ function Funnel({ asks, over = {} }: { asks: Offer[]; over?: Record<string, unkn
   )
 }
 
+/**
+ * The panel under a parent that owns the book, which is where the funnel got stuck.
+ *
+ * `asks` is state here because it is state on the coin page: `onTraded` triggers
+ * the read that drops the ask which was just filled. A fixture that passes a
+ * frozen array can never show what happens once the book *stops* changing, and
+ * that is the only condition under which "Back to the book" went wrong.
+ */
+function FillableFunnel({ asks: opening, over = {} }: { asks: Offer[]; over?: Record<string, unknown> }) {
+  const [asks, setAsks] = useState(opening)
+  return (
+    <MarketStateProvider value={market(over)}>
+      <BuyFunnel
+        listing={LISTING}
+        asks={asks}
+        held={0}
+        loading={false}
+        onTraded={() => setAsks((rows) => rows.slice(1))}
+      >
+        <p>the bid form</p>
+      </BuyFunnel>
+    </MarketStateProvider>
+  )
+}
+
+/** Enough state to take a row, and a provider that actually runs the job. */
+const CAN_BUY: Record<string, unknown> = {
+  funds: { confirmed: 10n ** 18n, incoming: 0n, arrivals: 0, inFlight: [] },
+  trader: { address: YOU, accept: async () => {} },
+  act: async (_kind: string, _what: string, job: () => Promise<void>) => {
+    await job()
+    return { signed: true, problem: null }
+  },
+}
+
+/** Buy the top row and settle it. Leaves the panel on `settled`. */
+async function buyTheTopRow(view: Rendered): Promise<void> {
+  view.click(view.find('tbody button'))
+  await flush()
+  view.click(view.all('button').find((node) => node.textContent === 'Confirm the buy')!)
+  await flush()
+}
+
+/** The step the indicator is announcing, as it prints it. */
+function currentStep(view: Rendered): string | undefined {
+  return view.all('ol li').find((node) => node.getAttribute('aria-current') === 'step')?.textContent ?? undefined
+}
+
 test('the five steps are named in order, and the current one is announced as a step', () => {
   const view = render(<Funnel asks={[offer()]} />)
   const steps = view.all('ol li')
@@ -587,6 +636,59 @@ test('a refusal goes back to the book with the ledger’s own words', async () =
 
   expect(view.find('[role="alert"]').textContent).toBe('That offer has already been accepted.')
   expect(view.find('tbody button')).toBeTruthy()
+  view.unmount()
+})
+
+test('Back to the book after a partial fill lands on the rows that are still there', async () => {
+  const view = render(
+    <FillableFunnel asks={[offer({ from: 'kei_first' }), offer({ from: 'kei_second' })]} over={CAN_BUY} />,
+  )
+
+  await buyTheTopRow(view)
+  expect(view.text()).toContain('Settled')
+
+  view.click(view.all('button').find((node) => node.textContent === 'Back to the book')!)
+  await flush()
+
+  // The second seller's offer is still open, and still rendered. Nothing about
+  // this click changes `asks.length` or `loading`, which were the only things
+  // that re-derived the step — so the panel announced "nothing for sale" with a
+  // takeable row directly underneath it, and only came right if a third party
+  // traded.
+  expect(view.all('tbody button')).toHaveLength(1)
+  expect(currentStep(view)).toBe('2. pick a quote')
+  expect(view.text()).not.toContain('No trades yet and nobody is selling CARPET')
+  view.unmount()
+})
+
+test('Back to the book after the last offer goes says nothing is for sale, and means it', async () => {
+  const view = render(<FillableFunnel asks={[offer({ from: 'kei_only' })]} over={CAN_BUY} />)
+
+  await buyTheTopRow(view)
+  view.click(view.all('button').find((node) => node.textContent === 'Back to the book')!)
+  await flush()
+
+  // The other half of the same claim: the step follows the book, so an empty
+  // book must not be re-derived into `quote` by a fix that just forces it.
+  expect(view.all('tbody button')).toHaveLength(0)
+  expect(currentStep(view)).toBe('1. nothing for sale')
+  expect(view.text()).toContain('No trades yet and nobody is selling CARPET')
+  view.unmount()
+})
+
+test('a book that empties under a confirmation does not rewind it', async () => {
+  const view = render(<FillableFunnel asks={[offer({ from: 'kei_first' }), offer({ from: 'kei_second' })]} over={CAN_BUY} />)
+
+  view.click(view.find('tbody button'))
+  await flush()
+  expect(currentStep(view)).toBe('3. confirm the terms')
+
+  // `quoted`'s own guard is what forbids rewinding, not the effect's dependency
+  // list. Re-deriving the step on every step change must not drag a
+  // confirmation back onto the book when the poll finds fewer rows.
+  view.click(view.all('button').find((node) => node.textContent === 'Confirm the buy')!)
+  await flush()
+  expect(currentStep(view)).toBe('5. settled')
   view.unmount()
 })
 
