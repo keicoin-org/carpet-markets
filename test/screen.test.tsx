@@ -13,7 +13,7 @@
  * about markup and the router is not part of any of them.
  */
 
-import { expect, mock, test } from 'bun:test'
+import { afterEach, expect, mock, test } from 'bun:test'
 import { act, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { Expectation, Offer } from 'kei-transaction'
@@ -33,7 +33,7 @@ function hrefOf(href: unknown): string {
   return `${target.pathname ?? ''}${query ? `?${query}` : ''}${target.hash ? `#${target.hash}` : ''}`
 }
 
-const { render } = await import('./dom.js')
+const { render, unmountAll } = await import('./dom.js')
 const { BuyFunnel } = await import('../components/BuyFunnel.js')
 const { Caveat } = await import('../components/Caveat.js')
 const { CoinCard } = await import('../components/CoinCard.js')
@@ -42,6 +42,7 @@ const { PolicyBadge } = await import('../components/PolicyBadge.js')
 const { Readout } = await import('../components/Readout.js')
 const { Tabs } = await import('../components/Tabs.js')
 const { Ladder } = await import('../components/OrderBook.js')
+const { TradePanel } = await import('../components/TradePanel.js')
 const { METRICS, metric } = await import('../lib/metrics.js')
 const { NO_FUNDS } = await import('../lib/balance.js')
 const { FEED_OPENING } = await import('../lib/feed.js')
@@ -52,6 +53,12 @@ const { MarketStateProvider } = await import('../lib/use-market.js')
 import type { MetricContext } from '../lib/metrics'
 import type { Book, Listing } from '../shared/listing'
 import type { Rendered } from './dom'
+
+// A test that fails before its own `unmount()` would otherwise leave a
+// `document` installed for the rest of the process, and `test/terms.test.ts`
+// starts a registry — which `Kei.server()` refuses to do in anything that looks
+// like a browser (SPEC §6.3). One wrong assertion here should cost one failure.
+afterEach(unmountAll)
 
 const ASSET = 'asset-CARPET'
 const YOU = 'kei_you'
@@ -323,6 +330,99 @@ test('an empty side says nobody is selling rather than showing a price with noth
   )
   expect(view.text()).toContain('Nobody is selling CARPET')
   expect(view.all('button')).toHaveLength(0)
+  view.unmount()
+})
+
+// ------------------------- criterion 2, from a keystroke rather than a value
+
+/**
+ * The trade panel, with enough state around it that both tabs are usable.
+ *
+ * Funded, because `Note` shows one sentence: a blocker if there is one and the
+ * running total otherwise. An unfunded bidder reads "0 is spendable" and never
+ * gets as far as what their Amount parsed to.
+ */
+function panel(over: Record<string, unknown> = {}, held = 5_000) {
+  return render(
+    <MarketStateProvider value={market({ funds: { ...NO_FUNDS, confirmed: 100n * KEI_RAW }, ...over })}>
+      <TradePanel listing={LISTING} book={EMPTY_BOOK} held={held} loading={false} onTraded={() => {}} />
+    </MarketStateProvider>,
+  )
+}
+
+function tab(view: Rendered, name: 'buy' | 'sell'): HTMLButtonElement {
+  const found = view.all<HTMLButtonElement>('[role="tab"]').find((button) => view.name(button).startsWith(name === 'buy' ? 'Buy' : 'Sell'))
+  if (!found) throw new Error(`No ${name} tab rendered.`)
+  return found
+}
+
+/** The Amount field, found the way a person finds it — by its label. */
+function amountField(view: Rendered): HTMLInputElement {
+  const found = view.all<HTMLInputElement>('input').find((input) => view.name(input).startsWith('Amount'))
+  if (!found) throw new Error('No field labelled Amount rendered.')
+  return found
+}
+
+test('typing 2.5 into the sell Amount says on screen that it is 2 CARPET', () => {
+  const view = panel()
+  view.click(tab(view, 'sell'))
+  view.type(amountField(view), '2.5')
+
+  // The assertion PR #22 could not write: the note, rendered, from a keystroke.
+  expect(view.text()).toContain('CARPET has no decimal places, so that is 2 CARPET.')
+  view.unmount()
+})
+
+test('typing 2.5 into the bid Amount says the same thing on the buy side', () => {
+  const view = panel()
+  view.type(amountField(view), '2.5')
+  expect(view.text()).toContain('CARPET has no decimal places, so that is 2 CARPET.')
+  view.unmount()
+})
+
+test('a whole number carries no truncation note', () => {
+  const view = panel()
+  view.click(tab(view, 'sell'))
+  view.type(amountField(view), '250')
+  expect(view.text()).not.toContain('no decimal places')
+  expect(view.text()).toContain('Asking')
+  view.unmount()
+})
+
+test('the half-typed decimal on the way to 2.5 is refused, not thrown on', () => {
+  const view = panel()
+  view.click(tab(view, 'sell'))
+  // `2.` is what the field holds between the two keystrokes, and `parseCoins`
+  // calls it malformed. Typed rather than assigned, so the intermediate states
+  // are rendered too.
+  view.type(amountField(view), '2.')
+  expect(view.text()).toContain('That is not a number')
+  view.unmount()
+})
+
+test('an empty Amount refuses rather than offering to list nothing', () => {
+  const view = panel()
+  view.click(tab(view, 'sell'))
+  view.type(amountField(view), '')
+  expect(view.find<HTMLInputElement>('input[aria-invalid="true"]')).toBeTruthy()
+  view.unmount()
+})
+
+test('a grouping separator is refused rather than silently multiplied by ten', () => {
+  const view = panel()
+  view.click(tab(view, 'sell'))
+  // `1,5` is one-and-a-half to half the world and fifteen to the other half.
+  view.type(amountField(view), '1,5')
+  expect(view.text()).toContain('That is not a number')
+  view.unmount()
+})
+
+test('typing more than you hold is refused with the number you can move', () => {
+  const view = panel({}, 10)
+  view.click(tab(view, 'sell'))
+  view.type(amountField(view), '5000')
+  expect(view.text()).toContain('You can list 10 CARPET, not 5,000.')
+  expect(view.find<HTMLInputElement>('input[aria-invalid="true"]')).toBeTruthy()
   view.unmount()
 })
 
@@ -704,6 +804,34 @@ test('a caveat renders the registry’s sentence and cites its section', () => {
 test('a caveat with no section cites none rather than inventing one', () => {
   const view = render(<Caveat id="one-quote" />)
   expect(view.text()).not.toContain('SPEC §')
+  view.unmount()
+})
+
+// --------------------------------------------------------------- the harness
+
+test('an input event reaches onChange, which is the whole of #23', () => {
+  // Named separately from the panel tests because when this breaks the cause is
+  // never the panel: it is `react-dom` having been evaluated before a `window`
+  // existed, which makes it decide there is no `input` event and watch keys
+  // instead for the life of the process. A static `import` of it in `test/dom.ts`
+  // is enough to do that, and this is the test that says so.
+  const seen: string[] = []
+  function Field() {
+    const [value, setValue] = useState('start')
+    return (
+      <input
+        aria-label="field"
+        value={value}
+        onChange={(event) => {
+          seen.push(event.target.value)
+          setValue(event.target.value)
+        }}
+      />
+    )
+  }
+  const view = render(<Field />)
+  view.type(view.find('input'), 'ab')
+  expect(seen).toEqual(['', 'a', 'ab'])
   view.unmount()
 })
 
