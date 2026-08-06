@@ -488,9 +488,14 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
     await pay(to, raw)
   }
 
-  function take(address: string): Intent | undefined {
+  /** Drop every quote nobody paid for inside the TTL. */
+  function sweepIntents(): void {
     const current = now()
     for (const [who, intent] of intents) if (current - intent.at > ttl) intents.delete(who)
+  }
+
+  function take(address: string): Intent | undefined {
+    sweepIntents()
     const intent = intents.get(address)
     intents.delete(address)
     return intent
@@ -535,6 +540,24 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
       for (const coin of coins.values()) {
         if (coin.symbol === symbol) {
           throw new ListingError(`${symbol} is already listed here. Pick another symbol.`)
+        }
+      }
+
+      // A symbol is also taken while somebody is on their way to pay for it. A
+      // quote lands in `intents` and only reaches `coins` when the payment
+      // settles, so scanning settled coins alone left the whole TTL open: two
+      // people could quote DOGE inside two minutes, both pay a fee that is not
+      // refunded, and end up with two coins the board cannot tell apart (#17).
+      //
+      // The sweep runs first so an abandoned quote stops holding the ticker at
+      // the TTL rather than whenever the map is next written to, and the
+      // caller's own quote is skipped so re-quoting stays idempotent.
+      sweepIntents()
+      for (const [who, intent] of intents) {
+        if (who !== creator && intent.symbol === symbol) {
+          throw new ListingError(
+            `${symbol} was claimed a moment ago by somebody who is paying for it. Pick another symbol, or try this one again in a couple of minutes if their launch does not settle.`,
+          )
         }
       }
 
