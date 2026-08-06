@@ -17,8 +17,25 @@ import { Kei, MockNode, randomSeed } from 'kei-transaction'
 
 import { startRegistry, type Registry } from '../server/registry.js'
 
-/** Short enough that a test can outlive a quote without sleeping for two minutes. */
-const TTL_MS = 300
+/**
+ * Short enough that a test can outlive a quote without sleeping for two
+ * minutes, but not so short that it races real settlement.
+ *
+ * It was 300 ms, and that raced `take()`'s own sweep: `launch()` chains four
+ * signed blocks (fund the issuer, its receive, the issue, the mint) behind
+ * Alice's payment block, each doing real proof-of-work (`generateWork` in
+ * `@keicoin/core/work.js` is a synchronous, CPU-bound nonce search), and `bun
+ * test` runs every file's mock chain in one process. On a loaded runner that
+ * chain occasionally took longer than 300 ms to reach `onPayment`, so
+ * `sweepIntents()` deleted Alice's intent out from under her own arriving
+ * payment before `take()` could return it — silently, since an unmatched
+ * arrival is indistinguishable from ordinary top-up traffic (see the comment
+ * on `stopPayments` in `registry.ts`). The coin was never issued, so the poll
+ * below timed out waiting for something that was never going to appear,
+ * whatever deadline it was given — which is why raising that deadline alone
+ * (twice) did not fix the CI failures this replaces.
+ */
+const TTL_MS = 10_000
 
 let node: MockNode
 let registry: Registry
@@ -89,7 +106,9 @@ test('an abandoned quote stops holding its ticker once the TTL passes', async ()
   await Bun.sleep(TTL_MS + 50)
   const bobs = await registry.quoteLaunch(bob.address, identity('FRINGE'))
   expect(bobs.symbol).toBe('FRINGE')
-})
+  // Past TTL_MS itself now that it is 10s rather than 300ms — bun's 5s default
+  // budget is under the sleep above on its own.
+}, 15_000)
 
 test('a settled ticker is still refused after its intent is long gone', async () => {
   const quote = await registry.quoteLaunch(alice.address, identity('WARP'))
