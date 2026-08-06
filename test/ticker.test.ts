@@ -47,6 +47,22 @@ const identity = (symbol: string) => ({
   transfer: 'open' as const,
 })
 
+// Same shape as the `until` helper in registry.test.ts / ledger-claims.test.ts /
+// terms.test.ts. A 15 s default deadline is generous for the mock node, but the
+// settlement below signs a real block with proof of work behind it, and a loaded
+// runner has occasionally taken longer than that — hence the wider budget at the
+// one call site here that waits on it, matching what those other files do for
+// their own settling cases.
+async function until<T>(what: string, probe: () => Promise<T | undefined>, timeoutMs = 15_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const value = await probe()
+    if (value !== undefined) return value
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}.`)
+    await Bun.sleep(25)
+  }
+}
+
 test('a second launcher cannot quote a ticker somebody is already paying for', async () => {
   await registry.quoteLaunch(alice.address, identity('DOGE'))
 
@@ -79,21 +95,18 @@ test('a settled ticker is still refused after its intent is long gone', async ()
   const quote = await registry.quoteLaunch(alice.address, identity('WARP'))
   await alice.pay({ to: quote.to, amount: quote.fee })
 
-  const deadline = Date.now() + 15_000
-  for (;;) {
-    const listed = (await registry.facts()).listings.find((entry) => entry.symbol === 'WARP')
-    if (listed) break
-    if (Date.now() > deadline) throw new Error('Timed out waiting for WARP to be listed.')
-    await Bun.sleep(25)
-  }
+  await until(
+    'WARP to be listed',
+    async () => (await registry.facts()).listings.find((entry) => entry.symbol === 'WARP'),
+    40_000,
+  )
 
   // The intent was consumed by the settlement, so this is the settled-coin check
   // doing its original job — the new one must not have replaced it.
   await expect(registry.quoteLaunch(bob.address, identity('WARP'))).rejects.toThrow(/already listed here/)
-  // Longer than the 15s deadline above, because bun's default is 5s and a
-  // deadline the runner never lets you reach is not a deadline. This is the one
-  // case here that waits on a real settlement — a payment, the registry noticing
-  // it, and an issuance with its proof-of-work — and on a loaded runner that is
-  // comfortably past five seconds. The rest of the suite already carries
-  // explicit timeouts for the same reason.
-}, 30_000)
+  // Past the 40 s wait above with room to spare: this is the one case here that
+  // waits on a real settlement — a payment, the registry noticing it, and an
+  // issuance with its proof-of-work — and bun's 5 s default was never going to
+  // reach a deadline that long. The rest of the suite already carries explicit
+  // timeouts for the same reason.
+}, 45_000)
