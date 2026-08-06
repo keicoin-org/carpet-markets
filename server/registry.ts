@@ -114,7 +114,38 @@ export interface Registry {
    * `TRADER_LIMIT` — so being wrong here is still cheap, just no longer free.
    */
   watch(address: string): void
+  /**
+   * Launches that took a fee and then failed, newest first.
+   *
+   * Not routed anywhere public — a creator's own launch never fails silently
+   * from their side (they see the payment leave and nothing arrive), and this
+   * exists so that fact is checkable rather than only inferable. See `launch`
+   * for what "failed" already does about it on its own (#28).
+   */
+  failures(): readonly LaunchFailure[]
   close(): void
+}
+
+/**
+ * What a launch attempt cost, and what the registry managed to do about it,
+ * once it has failed after the fee arrived.
+ */
+export interface LaunchFailure {
+  at: number
+  creator: string
+  symbol: string
+  name: string
+  blurb: string
+  transfer: TransferPolicy
+  /** Decimal Kei that arrived for this attempt. */
+  paid: string
+  /** Decimal Kei actually sent back to `creator`. Less than `paid` only if the refund itself failed too. */
+  refunded: string
+  /** The issuing account this attempt funded, if it got that far. Its burn is not recoverable; its unspent margin is. */
+  issuer: string | null
+  /** Decimal Kei reclaimed off that account back to the registry. */
+  reclaimed: string
+  error: string
 }
 
 export class RegistryError extends Error {}
@@ -150,6 +181,15 @@ const ACTIVITY_MAX = 60
  * offer) is a further change, not made here; see world-of-wonder#18.
  */
 const TRADER_LIMIT = 128
+
+/**
+ * How many failed launches this process remembers.
+ *
+ * Bounded for the same reason `TRADER_LIMIT` is: this grows on its own, off a
+ * signal (a chain write failing) that a caller does not control the rate of.
+ * Old entries are exactly the ones least worth keeping — see `failures()`.
+ */
+const FAILURE_LOG_LIMIT = 200
 
 /** A coin nothing could be read about, which is not the same as a quiet one. */
 const NO_STATS = (supply: number): ListingStats => ({
@@ -245,6 +285,8 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
    * for how a payment still finds the right one, or refuses to guess (#27).
    */
   const intents = new Map<string, Intent>()
+  /** Newest first. See `FAILURE_LOG_LIMIT` and `recordFailure`. */
+  const failures: LaunchFailure[] = []
   const summaries = new Map<string, { at: number; stats: ListingStats }>()
   let activityCache: { at: number; trades: Trade[] } | undefined
   /**
@@ -356,41 +398,64 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
    * everything, and every coin anybody else ends up with came out of that pile
    * through an offer somebody accepted. Whether that pile can move at all is
    * `transfer`, and the node decides it, not this file.
+   *
+   * Four signed writes in sequence, on a real node any of them can fail on. A
+   * fee that already left the payer's wallet is not optional to account for —
+   * see `recordFailure` for what happens when one does (#28).
+   *
+   * The overpayment refund at the end is deliberately outside that net. By the
+   * time it runs the coin exists and the creator holds it; a failure there is
+   * a stuck refund on an otherwise-successful launch, not a failed one, and
+   * `recordFailure` would refund the *entire* fee on top of a launch that
+   * already delivered — paying the creator twice for one coin.
    */
   async function launch(creator: string, intent: Intent, paid: bigint): Promise<void> {
-    const issuer = await freshIssuer()
+    let issuer: Kei | undefined
+    try {
+      issuer = await freshIssuer()
 
-    // The burn comes out of the issuer's own balance, so it has to be there
-    // before the issue block is signed.
-    await kei.send(issuer.address, formatKei(LAUNCH_BURN_RAW + LAUNCH_MARGIN_RAW, 18))
-    await issuer.sync()
+      // The burn comes out of the issuer's own balance, so it has to be there
+      // before the issue block is signed.
+      await kei.send(issuer.address, formatKei(LAUNCH_BURN_RAW + LAUNCH_MARGIN_RAW, 18))
+      await issuer.sync()
 
-    const token = await issuer.token.issue({
-      name: intent.name,
-      symbol: intent.symbol,
-      decimals: 0,
-      maxSupply: LAUNCH_SUPPLY,
-      transfer: intent.transfer,
-      description: intent.blurb,
-    })
-    await token.mint(creator, LAUNCH_SUPPLY)
+      const token = await issuer.token.issue({
+        name: intent.name,
+        symbol: intent.symbol,
+        decimals: 0,
+        maxSupply: LAUNCH_SUPPLY,
+        transfer: intent.transfer,
+        description: intent.blurb,
+      })
+      await token.mint(creator, LAUNCH_SUPPLY)
 
-    coins.set(token.id, {
-      asset: token.id,
-      symbol: intent.symbol,
-      name: intent.name,
-      blurb: intent.blurb,
-      issuer: issuer.address,
-      creator,
-      transfer: intent.transfer,
-      supply: LAUNCH_SUPPLY,
-      launchedAt: now(),
-      issuerWallet: issuer,
-    })
-    announce(creator)
+      coins.set(token.id, {
+        asset: token.id,
+        symbol: intent.symbol,
+        name: intent.name,
+        blurb: intent.blurb,
+        issuer: issuer.address,
+        creator,
+        transfer: intent.transfer,
+        supply: LAUNCH_SUPPLY,
+        launchedAt: now(),
+        issuerWallet: issuer,
+      })
+      announce(creator)
+    } catch (error) {
+      await recordFailure(creator, intent, paid, issuer, error)
+      return
+    }
 
     const change = paid - LAUNCH_FEE_RAW
-    if (change > 0n) await pay(creator, change)
+    if (change > 0n) {
+      await pay(creator, change).catch((error: unknown) => {
+        console.error(
+          `  could not send ${formatKei(change, 8)} Kei of overpayment back to ${creator.slice(0, 16)}… after a successful launch: `,
+          error instanceof Error ? error.message : error,
+        )
+      })
+    }
   }
 
   // ------------------------------------------------------------- reading back
@@ -544,6 +609,76 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
   async function refund(to: string, raw: bigint, why: string): Promise<void> {
     console.warn(`  refund ${formatKei(raw, 8)} Kei to ${to.slice(0, 16)}… — ${why}`)
     await pay(to, raw)
+  }
+
+  /**
+   * What `launch` does once one of its writes has failed: reclaim what can be
+   * reclaimed, refund what was paid, and keep a record of both — durable for
+   * the life of this process, which is what every other piece of state here
+   * already is (`coins`, `intents`, `traders`), and a Worker's replay rebuilds
+   * this file from the same events either way.
+   *
+   * Called from inside the write queue, never through it.
+   */
+  async function recordFailure(
+    creator: string,
+    intent: Intent,
+    paid: bigint,
+    issuer: Kei | undefined,
+    error: unknown,
+  ): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error(`  launch failed for ${creator.slice(0, 16)}… (${intent.symbol}): ${message}`)
+
+    // `freshIssuer` never looks at this index again once it has a block on it
+    // (see its own comment), so a balance left sitting here is not lost — only
+    // invisible to every future read this file will ever do, unless it is
+    // reclaimed right now, while this is still the one place that remembers
+    // which account it is.
+    let reclaimedRaw = 0n
+    if (issuer) {
+      try {
+        await issuer.sync()
+        const stranded = await rawBalance(issuer.address)
+        if (stranded > 0n) {
+          await issuer.send(kei.address, formatKei(stranded, 18))
+          reclaimedRaw = stranded
+        }
+      } catch (reclaimError) {
+        console.error(
+          `  could not reclaim the issuing account for ${intent.symbol}: `,
+          reclaimError instanceof Error ? reclaimError.message : reclaimError,
+        )
+      } finally {
+        issuer.close()
+      }
+    }
+
+    let refundedRaw = 0n
+    try {
+      await refund(creator, paid, `the launch failed: ${message}`)
+      refundedRaw = paid
+    } catch (refundError) {
+      console.error(
+        `  could not refund ${formatKei(paid, 8)} Kei to ${creator.slice(0, 16)}… after a failed launch: `,
+        refundError instanceof Error ? refundError.message : refundError,
+      )
+    }
+
+    failures.unshift({
+      at: now(),
+      creator,
+      symbol: intent.symbol,
+      name: intent.name,
+      blurb: intent.blurb,
+      transfer: intent.transfer,
+      paid: formatKei(paid, 18),
+      refunded: formatKei(refundedRaw, 18),
+      issuer: issuer?.address ?? null,
+      reclaimed: formatKei(reclaimedRaw, 18),
+      error: message,
+    })
+    failures.length = Math.min(failures.length, FAILURE_LOG_LIMIT)
   }
 
   /** Drop every quote nobody paid for inside the TTL. */
@@ -714,6 +849,8 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
     },
 
     watch: announce,
+
+    failures: () => failures,
 
     close() {
       stopPayments()
