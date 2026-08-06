@@ -30,6 +30,7 @@
 
 import {
   Kei,
+  isAddress,
   issuanceBurn,
   type KeiNode,
   type NetworkName,
@@ -106,6 +107,11 @@ export interface Registry {
    * (an account with no offers contributes nothing) and invisible in the other
    * (an unknown account's offers are simply not listed, exactly as they would
    * not be by any other reader who had not heard of them either).
+   *
+   * Reachable from an unauthenticated route, so this is also the one place
+   * anybody on the internet gets to grow the registry's own state (#29, #33).
+   * `address` is validated and the roster this feeds is bounded — see
+   * `TRADER_LIMIT` — so being wrong here is still cheap, just no longer free.
    */
   watch(address: string): void
   close(): void
@@ -120,6 +126,30 @@ const SUMMARY_TTL_MS = 4_000
 
 /** How deep the cross-coin ticker reads. Beyond this nobody is scrolling. */
 const ACTIVITY_MAX = 60
+
+/**
+ * How many accounts the registry will ever read on behalf of one coin.
+ *
+ * `watch` is reachable from an unauthenticated route and used to take any
+ * well-formed address, so without a ceiling the cost of every read was set by
+ * whoever last posted to it (#29, #33) — ten thousand invented addresses were
+ * ten thousand extra `balanceOf` calls per coin, per `facts()`, and `facts()`
+ * calls `holders()` for every coin listed, so the walk this bounds is
+ * coins × traders, not just traders. Measured against the mock node with one
+ * coin listed: 2.3 ms per `facts()` at traders=2, 209 ms at traders=10,002 —
+ * ninety times slower with zero network latency and one coin, which is a
+ * floor and not the deployed cost.
+ *
+ * `traders` evicts the least recently announced entry once this fills, which
+ * is the same trade-off `world-of-wonder/src/server/kei/Hall.ts` makes for the
+ * identical structure: the account least likely to be holding a live offer is
+ * the right one to forget, and hearing from it again puts it straight back.
+ * That bounds *cost*, not *visibility* — an unauthenticated flood can still
+ * evict real traders from a full roster, exactly as it could there. Protecting
+ * against that (not evicting accounts the last walk actually saw holding an
+ * offer) is a further change, not made here; see world-of-wonder#18.
+ */
+const TRADER_LIMIT = 128
 
 /** A coin nothing could be read about, which is not the same as a quiet one. */
 const NO_STATS = (supply: number): ListingStats => ({
@@ -207,8 +237,13 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
    * Creators are in here because they were minted the supply; buyers add
    * themselves through `watch`. This set is the entire reason the registry
    * exists, and it is the one piece of state that is not on the chain.
+   *
+   * A `Map` rather than a `Set` because insertion order is what bounds it: see
+   * `announce` and `TRADER_LIMIT`. The registry's own address is seeded in and
+   * never evicted — it costs one wasted read in the `from` arrays below, and
+   * losing it would silently drop the registry out of its own account walks.
    */
-  const traders = new Set<string>([kei.address])
+  const traders = new Map<string, true>([[kei.address, true]])
   /** Where to start looking for an unused issuer index. 0 is the registry itself. */
   let nextIndex = 1
   const writes = new Queue()
@@ -329,7 +364,7 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
       launchedAt: now(),
       issuerWallet: issuer,
     })
-    traders.add(creator)
+    announce(creator)
 
     const change = paid - LAUNCH_FEE_RAW
     if (change > 0n) await pay(creator, change)
@@ -349,7 +384,7 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
     const coin = coins.get(asset)
     if (!coin) throw new ListingError('That coin is not listed here.')
 
-    const from = [...traders]
+    const from = [...traders.keys()]
     const [giving, wanting, trades, price] = await Promise.all([
       kei.market.offers({ from, asset, state: 'open' }),
       kei.market.offers({ from, want: asset, state: 'open' }),
@@ -390,7 +425,7 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
     if (!coin) throw new ListingError('That coin is not listed here.')
 
     const token = await kei.token(asset)
-    const candidates = new Set<string>([...traders, coin.creator, coin.issuer])
+    const candidates = new Set<string>([...traders.keys(), coin.creator, coin.issuer])
     candidates.delete(kei.address)
 
     const rows = await Promise.all(
@@ -422,7 +457,7 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
     if (cached && Date.now() - cached.at < SUMMARY_TTL_MS) return cached.stats
 
     try {
-      const from = [...traders]
+      const from = [...traders.keys()]
       const [price, holding, asks] = await Promise.all([
         kei.market.price(coin.asset, { from }).catch(() => null),
         holders(coin.asset).catch(() => []),
@@ -463,7 +498,7 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
     const fresh = activityCache && Date.now() - activityCache.at < SUMMARY_TTL_MS
     if (!fresh) {
       const trades = await kei.market
-        .trades({ from: [...traders], last: ACTIVITY_MAX })
+        .trades({ from: [...traders.keys()], last: ACTIVITY_MAX })
         .catch(() => activityCache?.trades ?? [])
       activityCache = {
         at: Date.now(),
@@ -499,6 +534,31 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
     const intent = intents.get(address)
     intents.delete(address)
     return intent
+  }
+
+  /**
+   * Remember an address as worth reading, evicting the least recently
+   * announced one once `traders` fills. See `TRADER_LIMIT`.
+   *
+   * Rejects anything that is not a real address rather than the four-character
+   * prefix check this used to be — `kei_` followed by nothing at all used to
+   * pass, which meant the ceiling below was bounding "any string starting with
+   * `kei_`", not "any address" (#33).
+   */
+  function announce(address: string): void {
+    if (!isAddress(address)) return
+    // Delete first, so re-announcing moves this address to the end of the
+    // insertion order rather than leaving it where it was.
+    traders.delete(address)
+    traders.set(address, true)
+    if (traders.size <= TRADER_LIMIT) return
+    for (const oldest of traders.keys()) {
+      // Never the registry's own address — see the comment where `traders` is
+      // declared.
+      if (oldest === kei.address) continue
+      traders.delete(oldest)
+      break
+    }
   }
 
   function describe(coin: Coin): Listing {
@@ -574,7 +634,7 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
       }
 
       intents.set(creator, { at: now(), symbol, name, blurb, transfer })
-      traders.add(creator)
+      announce(creator)
       return { symbol, name, to: kei.address, fee: formatKei(LAUNCH_FEE_RAW, 18) }
     },
 
@@ -599,9 +659,7 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
       activityCache = undefined
     },
 
-    watch(address) {
-      if (typeof address === 'string' && address.startsWith('kei_')) traders.add(address)
-    },
+    watch: announce,
 
     close() {
       stopPayments()
