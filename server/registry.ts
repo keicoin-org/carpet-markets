@@ -210,6 +210,11 @@ interface Coin extends Listing {
 }
 
 interface Intent {
+  /**
+   * Who this quote is for, and never the map key it lives under — see
+   * `intents` for why.
+   */
+  creator: string
   at: number
   symbol: string
   name: string
@@ -228,6 +233,17 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
   const ttl = options.intentTtlMs ?? DEFAULT_INTENT_TTL_MS
 
   const coins = new Map<string, Coin>()
+  /**
+   * Live quotes, keyed by an id nobody but the quoter ever sees — never by
+   * `creator`.
+   *
+   * `POST /market/launch` takes an `address` out of the request body and
+   * proves nothing about it, so a slot keyed on that address is a slot anybody
+   * on the internet can write to. Keying on an unguessable id instead means a
+   * stranger naming somebody else's address can only ever *add* an intent
+   * under it, never overwrite the one its owner already has — see `resolve`
+   * for how a payment still finds the right one, or refuses to guess (#27).
+   */
   const intents = new Map<string, Intent>()
   const summaries = new Map<string, { at: number; stats: ListingStats }>()
   let activityCache: { at: number; trades: Trade[] } | undefined
@@ -308,19 +324,26 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
   // ------------------------------------------------------------------ payments
 
   const stopPayments = kei.onPayment((payment) => {
-    const intent = take(payment.from)
+    const outcome = resolve(payment.from)
     // Kei answering no quote stays here. An unmatched arrival is
     // indistinguishable from the faucet topping this account up, and a registry
     // that reflexively returned money to whoever sent it would return its own
     // working capital on startup.
-    if (!intent) return
+    if (!outcome) return
 
     const paid = rawOf(payment.amount)
-    void writes.run(() =>
-      paid + DUST_RAW < LAUNCH_FEE_RAW
+    void writes.run(() => {
+      if ('ambiguous' in outcome) {
+        return refund(
+          payment.from,
+          paid,
+          'more than one quote is waiting on this address and they do not agree on what to launch — quote one symbol at a time',
+        )
+      }
+      return paid + DUST_RAW < LAUNCH_FEE_RAW
         ? refund(payment.from, paid, 'that is less than the launch fee')
-        : launch(payment.from, intent, paid),
-    )
+        : launch(payment.from, outcome.intent, paid)
+    })
   })
 
   // ------------------------------------------------------------------- actions
@@ -526,14 +549,33 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
   /** Drop every quote nobody paid for inside the TTL. */
   function sweepIntents(): void {
     const current = now()
-    for (const [who, intent] of intents) if (current - intent.at > ttl) intents.delete(who)
+    for (const [id, intent] of intents) if (current - intent.at > ttl) intents.delete(id)
   }
 
-  function take(address: string): Intent | undefined {
+  /**
+   * What `creator`'s arriving payment is for, if that is unambiguous.
+   *
+   * `payment.from` is real proof of who is paying — it is a signed block — but
+   * it is not proof of *which* intent they meant, once more than one is live
+   * under that address. Keying `intents` by an id rather than by `creator`
+   * stops a stranger from overwriting somebody's real quote (#27), but a
+   * stranger can still *add* a second, different-symbol intent under an
+   * address they do not control. So this only ever resolves when every live
+   * intent for the payer agrees on what it is for; when they do not, both are
+   * consumed and refused rather than guessed between.
+   *
+   * The launch fee is flat, so unlike `Economy.settleGold` in world-of-wonder
+   * — the sibling structure this mirrors — the amount paid cannot break a tie.
+   * The symbol is what stands in for it here.
+   */
+  function resolve(creator: string): { intent: Intent } | { ambiguous: true } | undefined {
     sweepIntents()
-    const intent = intents.get(address)
-    intents.delete(address)
-    return intent
+    const mine = [...intents].filter(([, intent]) => intent.creator === creator)
+    if (mine.length === 0) return undefined
+    for (const [id] of mine) intents.delete(id)
+
+    const symbols = new Set(mine.map(([, intent]) => intent.symbol))
+    return symbols.size > 1 ? { ambiguous: true } : { intent: mine[0]![1] }
   }
 
   /**
@@ -613,8 +655,8 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
       // the TTL rather than whenever the map is next written to, and the
       // caller's own quote is skipped so re-quoting stays idempotent.
       sweepIntents()
-      for (const [who, intent] of intents) {
-        if (who !== creator && intent.symbol === symbol) {
+      for (const intent of intents.values()) {
+        if (intent.creator !== creator && intent.symbol === symbol) {
           throw new ListingError(
             `${symbol} was claimed a moment ago by somebody who is paying for it. Pick another symbol, or try this one again in a couple of minutes if their launch does not settle.`,
           )
@@ -633,7 +675,19 @@ export async function startRegistry(options: RegistryOptions): Promise<Registry>
         }
       }
 
-      intents.set(creator, { at: now(), symbol, name, blurb, transfer })
+      // Update in place when this creator already has a live intent for this
+      // exact symbol — a re-quote after editing the name or blurb, and the
+      // same request the loop above already lets through. Anything else is a
+      // new intent under a new, unguessable id: never a second write to a slot
+      // keyed on `creator`, which is the address a stranger could reuse (#27).
+      let id: string | undefined
+      for (const [existingId, intent] of intents) {
+        if (intent.creator === creator && intent.symbol === symbol) {
+          id = existingId
+          break
+        }
+      }
+      intents.set(id ?? crypto.randomUUID(), { creator, at: now(), symbol, name, blurb, transfer })
       announce(creator)
       return { symbol, name, to: kei.address, fee: formatKei(LAUNCH_FEE_RAW, 18) }
     },
