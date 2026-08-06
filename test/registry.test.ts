@@ -89,7 +89,13 @@ const keiOf = async (who: Kei): Promise<bigint> => {
 // ----------------------------------------------------------------------- tests
 
 test('nothing is issued until the fee is paid', async () => {
-  await registry.quoteLaunch(alice.address, {
+  // A throwaway wallet rather than alice or bob: this quote is deliberately
+  // abandoned, and it should stay abandoned rather than becoming a second live
+  // intent competing with whatever alice or bob quote next (#27) — a payment
+  // resolves against every live intent for its address, and one already-stale
+  // quote among them is exactly the ambiguity that check exists to refuse.
+  const ghost = await Kei.start({ node, network: 'mock', seed: randomSeed() })
+  await registry.quoteLaunch(ghost.address, {
     symbol: 'GHOST',
     name: 'Never Paid For',
     blurb: '',
@@ -97,6 +103,7 @@ test('nothing is issued until the fee is paid', async () => {
   })
   await Bun.sleep(150)
   expect((await registry.facts()).listings.some((entry) => entry.symbol === 'GHOST')).toBe(false)
+  ghost.close()
 })
 
 test('a paid launch mints the whole supply to whoever paid', async () => {
